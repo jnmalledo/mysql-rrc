@@ -1,0 +1,66 @@
+#!/bin/bash
+################################################################################
+#
+# Script:      rrc-pre
+# Maintainer:  jnmalledo@gmail.com
+# Version:     1.0
+# Description: This script should be executed before the MySQL instance starts
+#              and only has effect in replica instance pods. If an initial 
+#              cloning is needed, it connects to its "left buddy" pod to
+#              get a consistent state of its data files (using the xbstream 
+#              command), and placed them onto the MYSQL_DATADIR directory 
+#              (usually /var/lib/mysql). If this operation is successful, it 
+#              prepare datafiles to be served to the 'right buddy' pod (using
+#              the xtrabackup command)
+# Environment: * MYSQL_DATADIR: MySQL data directory
+#                Default: /var/ib/mysql
+# Usage:       rrc-pre         
+#
+################################################################################
+export RRC_BASE=${RRC_BASE:-/opt/rrc}
+export MYSQL_DATADIR=/var/lib/mysql/data
+source ${RRC_BASE}/rrc-env
+
+# Check if RRC_SOURCE_HOSTNAME variable is empty. If so, STS_HOSTNAME is
+# incorrect
+if [ -z "${RRC_SOURCE_HOSTNAME}" ] 
+then
+   echo "RRC ERROR: incorrect hostname '${STS_HOSTNAME}'. This pod doesn't seem to be created from an StatefulSet resource. Aborting startup"
+   exit 1
+fi
+
+# Check if current pod is source instance
+if [ ${RRC_ORDINAL} = 0 ]
+then
+   echo "RCC INFO: Source instance. There's no 'left buddy' to clone from. Nothing to do"
+   exit 0
+fi
+
+# Check if instance was already cloned
+if [ -d "${MYSQL_DATADIR}" ]
+then
+   echo "RRC INFO: This replica instance (${RRC_HOSTNAME}) was previously cloned (possible pod restart). Nothing to do"
+   exit 0
+fi
+mkdir "${MYSQL_DATADIR}" && chmod 775 "${MYSQL_DATADIR}" && chgrp 0 "${MYSQL_DATADIR}"
+
+# Clone from the left buddy
+echo "RRC INFO: Cloning from ${RRC_LEFTBUDDY_HOSTNAME}..."
+ncat --recv-only ${RRC_LEFTBUDDY_HOSTNAME} ${RRC_CLONEPORT} | xbstream -x -C ${MYSQL_DATADIR}
+if [ $? != 0 ]
+then
+   echo "RRC ERROR: failed restore (see above ouput for details). Aborting"
+   exit 1
+fi
+echo "RRC INFO: Restore from left buddy successful!"
+
+# Preparing backup files to be consumed by the 'right buddy'
+echo "RRC INFO: Preparing backup..."
+xtrabackup --prepare --target-dir=${MYSQL_DATADIR}
+if [ $? != 0 ]
+then
+   echo "RRC ERROR: failed backup preparation (see above ouput for details). Aborting"
+   exit 1
+fi
+echo "RRC INFO: Backup preparation successful!"
+exit 0

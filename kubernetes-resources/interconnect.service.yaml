@@ -1,0 +1,30 @@
+################################################################################
+# Service:     interconnect
+# Description: Headless service (clusterIP: None), needed to address StatefulSet
+#              pods individually
+# Ports:       * 3306 (Standard MySQL port)
+#              * 3307 (Clonation port)
+################################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+  name: interconnect
+spec:
+  clusterIP: None
+  ports:
+  - name: mysql-port
+    port: 3306
+    protocol: TCP
+    targetPort: 3306
+  - name: mysql-clone
+    port: 3307
+    protocol: TCP
+    targetPort: 3307
+  publishNotReadyAddresses: true
+  selector:
+    app: mysql
+    app.kubernetes.io/name: mysql
+  type: ClusterIP

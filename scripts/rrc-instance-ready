@@ -1,0 +1,2 @@
+#!/bin/bash
+exec mysql -u${MYSQL_BACKUP_USER} -p${MYSQL_BACKUP_PASSWORD} -h127.0.0.1 -e "SELECT 1;"

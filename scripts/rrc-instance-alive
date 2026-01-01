@@ -1,0 +1,2 @@
+#!/bin/bash
+exec mysqladmin ping -uroot -p${MYSQL_ROOT_PASSWORD}

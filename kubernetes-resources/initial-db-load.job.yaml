@@ -1,0 +1,105 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    batch.kubernetes.io/job-name: initial-db-load
+    job-name: initial-db-load
+  name: initial-db-load
+spec:
+  backoffLimit: 6
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  selector:
+    matchLabels:
+      batch.kubernetes.io/job-name: initial-db-load
+      job-name: initial-db-load
+  suspend: false
+  template:
+    metadata:
+      labels:
+        batch.kubernetes.io/job-name: initial-db-load
+        job-name: initial-db-load
+    spec:
+      containers:
+      - name: initial-db-load
+        image: registry.redhat.io/rhel9/mysql-80:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - "-c"
+        - |-
+          # Since this container may be executed while MySQL instance is starting, we need to
+          # wait until it's ready to accept connections
+          echo "RRC INFO: Waiting for Source mysqld to accept connections..."
+          until mysql \
+            --user="${MYSQL_USER}" \
+            --password="${MYSQL_PASSWORD}" \
+            --host="${MYSQL_HOST}" \
+            --port=${MYSQL_PORT} \
+            --database="${MYSQL_DATABASE}" \
+            --execute "SELECT 1;" > /dev/null 2>&1
+          do
+            sleep 5
+          done
+          echo "RRC INFO: Instance ready at ${MYSQL_HOST}:${MYSQL_PORT}"
+          echo "RRC INFO: Loading database..."
+          echo "RRC_INFO: Executing
+          mysql 
+            --user='${MYSQL_USER}' 
+            --password='*************' 
+            --host='${MYSQL_HOST}' 
+            --port=${MYSQL_PORT} 
+            --database='${MYSQL_DATABASE}' 
+            --execute '${MYSQL_SOURCE_COMMAND}'"
+          exec mysql \
+            --user="${MYSQL_USER}" \
+            --password="${MYSQL_PASSWORD}" \
+            --host="${MYSQL_HOST}" \
+            --port=${MYSQL_PORT} \
+            --database="${MYSQL_DATABASE}" \
+            --execute "${MYSQL_SOURCE_COMMAND}"
+        env:
+        - name: MYSQL_HOST
+          value: "mysql-0.interconnect"
+        - name: MYSQL_PORT
+          value: "3306"
+        - name: MYSQL_SOURCE_COMMAND
+          value: "SOURCE /mnt/test/db.dump"
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              key: MYSQL_USER
+              name: mysql-creds
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: MYSQL_PASSWORD
+              name: mysql-creds
+        - name: MYSQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              key: MYSQL_DATABASE
+              name: mysql-creds
+        resources:
+          limits:
+            cpu: 200m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /mnt/test
+          name: dbdump-vol
+      dnsPolicy: ClusterFirst
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - configMap:
+          defaultMode: 0666
+          name: dbdump
+        name: dbdump-vol

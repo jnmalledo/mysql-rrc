@@ -1,0 +1,23 @@
+################################################################################
+# Service:     mysql-read
+# Description: Read-only service to round-robin access the StatefulSet pods for
+#              SELECTS
+# Ports:       * 3306 (Standard MySQL port)
+################################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+  name: mysql-read
+spec:
+  ports:
+  - name: mysql-port
+    port: 3306
+    protocol: TCP
+    targetPort: 3306
+  selector:
+    app: mysql
+    app.kubernetes.io/name: mysql
+  type: ClusterIP
