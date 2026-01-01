@@ -5,6 +5,8 @@ The kubernetes-resources directory contains individual resource manifest, (almos
 
 The openshift-resources directory contains a template resource manifest, to deploy the RRC. It only works in a OpenShift Cluster
 
+A helm chart version is published in the following repository https://jnmalledo.github.io/helm-charts
+
 The scripts directory contains some scripts. The following scripts are packed in a configmap, and will be mounted in a MySQL container pulled from registry.redhat.io:
 
 * rrc-env
@@ -44,6 +46,7 @@ To configure pod access to RRC:
 3. Heavy reader endpoint. For heavy select operations, use this endpoint instead:
         mysql-n.interconnect
    (n > 0)
+
 
 
 Enjoy
