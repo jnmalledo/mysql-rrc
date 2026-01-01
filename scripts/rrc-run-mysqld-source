@@ -1,0 +1,59 @@
+#!/bin/bash
+#
+# This is an entrypoint that runs the MySQL server in the 'source' mode.
+#
+
+export_vars=$(cgroup-limits); export $export_vars
+source ${CONTAINER_SCRIPTS_PATH}/common.sh
+set -eu
+if [[ -v DEBUG_IGNORE_SCRIPT_FAILURES ]]; then
+  set +e
+fi
+
+export_setting_variables
+
+log_volume_info $MYSQL_DATADIR
+
+export MYSQL_RUNNING_AS_SOURCE=1
+# use previously used value for compatibility
+export MYSQL_RUNNING_AS_MASTER=1
+
+# The 'server-id' for source needs to be constant
+# RRC
+#export MYSQL_SERVER_ID=1
+export MYSQL_SERVER_ID=${RRC_SERVERID_OFFSET}
+log_info "The 'source' server-id is ${MYSQL_SERVER_ID}"
+
+# pre-init files
+process_extending_files ${APP_DATA}/mysql-pre-init/ ${CONTAINER_SCRIPTS_PATH}/pre-init/
+
+if [ ! -d "$MYSQL_DATADIR/mysql" ]; then
+  initialize_database "$@"
+else
+  start_local_mysql "$@"
+fi
+
+log_info 'Setting passwords ...'
+[ -f ${CONTAINER_SCRIPTS_PATH}/passwd-change.sh ] && source ${CONTAINER_SCRIPTS_PATH}/passwd-change.sh
+
+# Setup the 'source' replication user and 'backup' user on the MySQL server
+mysql $mysql_flags <<EOSQL
+  CREATE USER IF NOT EXISTS '${MYSQL_SOURCE_USER}'@'%' IDENTIFIED BY '${MYSQL_SOURCE_PASSWORD}';
+  GRANT REPLICATION SLAVE ON *.* TO '${MYSQL_SOURCE_USER}'@'%';
+  CREATE USER IF NOT EXISTS '${MYSQL_BACKUP_USER}'@'%' IDENTIFIED BY '${MYSQL_BACKUP_PASSWORD}';
+  GRANT BACKUP_ADMIN, PROCESS, RELOAD, LOCK TABLES, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN ON *.* TO '${MYSQL_BACKUP_USER}'@'%';
+  GRANT SELECT ON performance_schema.log_status TO '${MYSQL_BACKUP_USER}'@'%';
+  GRANT SELECT ON performance_schema.keyring_component_status TO '${MYSQL_BACKUP_USER}'@'%';
+  GRANT SELECT ON performance_schema.replication_group_members TO '${MYSQL_BACKUP_USER}'@'%';
+  FLUSH PRIVILEGES;
+EOSQL
+
+# init files
+process_extending_files ${APP_DATA}/mysql-init/ ${CONTAINER_SCRIPTS_PATH}/init/
+
+# Restart the MySQL server with public IP bindings
+shutdown_local_mysql
+unset_env_vars
+log_volume_info $MYSQL_DATADIR
+log_info 'Running final exec -- Only MySQL server logs after this point'
+exec ${MYSQL_PREFIX}/libexec/mysqld --defaults-file=$MYSQL_DEFAULTS_FILE "$@" 2>&1

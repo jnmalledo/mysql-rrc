@@ -1,0 +1,96 @@
+#!/bin/bash
+################################################################################
+#
+# Script:      rrc-env
+# Maintainer:  jnmalledo@gmail.com
+# Version:     1.0
+# Description: Set the StatefulSet-based Read Replica Cluster (RRC) environment
+#              variables. If STS_HOSTNAME doesn't follow the StatefulSet 
+#              naming convention, the following variables will be set to ""
+#              * RRC_SOURCE_HOSTNAME
+#              * RRC_REPLICA_HOSTNAME
+#              * RRC_LEFTBUDDY_HOSTNAME
+#              * RRC_RIGHTBUDDY_HOSTNAME
+# Environment: The following variables are set by this script:
+#              * RRC_HOSTNAME: Pod name that override the official hostname
+#                Default: HOSTNAME (env var)
+#              * RRC_SERVERID_OFFSET: Offset to be added to the StatefulSet pod
+#                name's ordinal value to setup server_id global instance var.
+#                It's used to avoid reserved value "0" for this variable
+#                Default: 10
+#              * RRC_CLONEPORT: Port in which current instance's "left buddy"
+#                should be listening for initial clone requests
+#                Default: 3307
+#              * RRC_HLSERVICE: Name of the headless kubernetes service used
+#                to access pods in a discretional way. This is needed to access
+#                the source host (for example, mysql-0.interconnect) or the 
+#                "left buddy" (mysql-1.interconnect, left buddy of mysql-2). 
+#                This value is optional while working in "container mode" 
+#                (docker or podman), but required while working in Kubernetes
+#              * RRC_STSNAME: StatefulSet name. Obtained from STS_HOSTNAME 
+#                variable, it's the first token before the final -number 
+#                pattern. For example, if STS_HOSTNAME=mysql-80-3, RRC_STSNAME
+#                is 'mysql-80'
+#              * RRC_ORDINAL: Ordinal name. Obtained from STS_HOSTNAME 
+#                variable, it's the second token of the final -number 
+#                pattern. For example, if STS_HOSTNAME=mysql-80-3, RRC_ORDINAL
+#                is '3'              
+#              * RRC_SOURCE_HOSTNAME: Source instance FQHN. Possible values:
+#                o ${RRC_STSNAME}-0.${RRC_HLSERVICE}, if RRC_HLSERVICE is set
+#                o ${RRC_STSNAME}-0 otherwise
+#              * RRC_REPLICA_HOSTNAME: Replica instance FQHN. Possible values:
+#                o "", if RRC_ORDINAL is 0
+#                o ${RRC_STSNAME}-${RRC_ORDINAL}.${RRC_HLSERVICE}, if 
+#                  RRC_HLSERVICE is set
+#                o ${RRC_STSNAME}-${RRC_ORDINAL} otherwise
+#              * RRC_LEFTBUDDY_HOSTNAME: The current instance's left buddy FQHN. 
+#                Possible values:
+#                o "", if RRC_ORDINAL is 0
+#                o ${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )).${RRC_HLSERVICE}, if 
+#                  RRC_HLSERVICE is set
+#                o ${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )) otherwise
+#              * RRC_RIGHTBUDDY_HOSTNAME: The current instance's right buddy FQHN. 
+#                This var is for informational purposes only Possible values:
+#                o ${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )).${RRC_HLSERVICE}, if 
+#                  RRC_HLSERVICE is set
+#                o ${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )) otherwise
+# Usage:       source rrc-env  
+#
+################################################################################
+export RRC_HOSTNAME=${RRC_HOSTNAME:-${HOSTNAME}}
+export RRC_SERVERID_OFFSET=${RRC_SERVERID_OFFSET:-10}
+export RRC_CLONEPORT=${RRC_CLONEPORT:-3307}
+export RRC_SOURCE_HOSTNAME=""
+export RRC_REPLICA_HOSTNAME=""
+export RRC_LEFTBUDDY_HOSTNAME=""
+export RRC_RIGHTBUDDY_HOSTNAME=""
+export RRC_STSNAME=""
+export RRC_ORDINAL=""
+export MYSQL_SOURCE_SERVICE_NAME=""
+
+if [[ ${RRC_HOSTNAME} =~ ^(.*)-([0-9]+)$ ]] 
+then
+   
+   # Hostname is correct (Compatible with StatefulSet naming convention)
+   RRC_STSNAME=${BASH_REMATCH[1]}
+   RRC_ORDINAL=${BASH_REMATCH[2]}
+   if [ -z "${RRC_HLSERVICE}" ] 
+   then
+      RRC_SOURCE_HOSTNAME="${RRC_STSNAME}-0"
+      RRC_RIGHTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL + 1 ))"
+      if [ ${RRC_ORDINAL} != 0 ] 
+      then
+         RRC_REPLICA_HOSTNAME="${RRC_STSNAME}-${RRC_ORDINAL}"
+         RRC_LEFTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL - 1 ))"
+      fi
+   else
+      RRC_SOURCE_HOSTNAME="${RRC_STSNAME}-0.${RRC_HLSERVICE}"
+      RRC_RIGHTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )).${RRC_HLSERVICE}"
+      if [ ${RRC_ORDINAL} != 0 ] 
+      then
+         RRC_REPLICA_HOSTNAME="${RRC_STSNAME}-${RRC_ORDINAL}.${RRC_HLSERVICE}"
+         RRC_LEFTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )).${RRC_HLSERVICE}"
+      fi
+   fi
+   MYSQL_SOURCE_SERVICE_NAME=${RRC_SOURCE_HOSTNAME}
+fi

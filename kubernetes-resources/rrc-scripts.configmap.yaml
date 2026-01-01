@@ -1,0 +1,275 @@
+################################################################################
+# Configmap:   rrc-scripts
+# Description: MySQL RRC scripts. Execution of either Source or Replica role,
+#              depending on the StatefulSet pod ordinal
+# Variables:   None
+# Files:       * rrc-env: Set the RRC context using environment variables
+#              * rrc-run-mysqld: RRC container entry-point
+#              * rrc-run-mysqld-source: Called by RRC container entry-point
+#                when pod ordinal = 0
+#              * rrc-run-mysqld-replica: Called by RRC container entry-point
+#                when pod ordinal > 0
+#              * rrc-instance-alive: For liveness probe 
+#              * rrc-instance-ready: For readiness probe
+################################################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app: mysql
+    app.kubernetes.io/name: mysql
+  name: rrc-scripts
+data:
+  rrc-env: |-
+    #!/bin/bash
+    ################################################################################
+    #
+    # Script:      rrc-env
+    # Maintainer:  jnmalledo@gmail.com
+    # Version:     1.0
+    # Description: Set the StatefulSet-based Read Replica Cluster (RRC) environment
+    #              variables. If STS_HOSTNAME doesn't follow the StatefulSet 
+    #              naming convention, the following variables will be set to ""
+    #              * RRC_SOURCE_HOSTNAME
+    #              * RRC_REPLICA_HOSTNAME
+    #              * RRC_LEFTBUDDY_HOSTNAME
+    #              * RRC_RIGHTBUDDY_HOSTNAME
+    # Environment: The following variables are set by this script:
+    #              * RRC_HOSTNAME: Pod name that override the official hostname
+    #                Default: HOSTNAME (env var)
+    #              * RRC_SERVERID_OFFSET: Offset to be added to the StatefulSet pod
+    #                name's ordinal value to setup server_id global instance var.
+    #                It's used to avoid reserved value "0" for this variable
+    #                Default: 10
+    #              * RRC_CLONEPORT: Port in which current instance's "left buddy"
+    #                should be listening for initial clone requests
+    #                Default: 3307
+    #              * RRC_HLSERVICE: Name of the headless kubernetes service used
+    #                to access pods in a discretional way. This is needed to access
+    #                the source host (for example, mysql-0.interconnect) or the 
+    #                "left buddy" (mysql-1.interconnect, left buddy of mysql-2). 
+    #                This value is optional while working in "container mode" 
+    #                (docker or podman), but required while working in Kubernetes
+    #              * RRC_STSNAME: StatefulSet name. Obtained from STS_HOSTNAME 
+    #                variable, it's the first token before the final -number 
+    #                pattern. For example, if STS_HOSTNAME=mysql-80-3, RRC_STSNAME
+    #                is 'mysql-80'
+    #              * RRC_ORDINAL: Ordinal name. Obtained from STS_HOSTNAME 
+    #                variable, it's the second token of the final -number 
+    #                pattern. For example, if STS_HOSTNAME=mysql-80-3, RRC_ORDINAL
+    #                is '3'              
+    #              * RRC_SOURCE_HOSTNAME: Source instance FQHN. Possible values:
+    #                o ${RRC_STSNAME}-0.${RRC_HLSERVICE}, if RRC_HLSERVICE is set
+    #                o ${RRC_STSNAME}-0 otherwise
+    #              * RRC_REPLICA_HOSTNAME: Replica instance FQHN. Possible values:
+    #                o "", if RRC_ORDINAL is 0
+    #                o ${RRC_STSNAME}-${RRC_ORDINAL}.${RRC_HLSERVICE}, if 
+    #                  RRC_HLSERVICE is set
+    #                o ${RRC_STSNAME}-${RRC_ORDINAL} otherwise
+    #              * RRC_LEFTBUDDY_HOSTNAME: The current instance's left buddy FQHN. 
+    #                Possible values:
+    #                o "", if RRC_ORDINAL is 0
+    #                o ${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )).${RRC_HLSERVICE}, if 
+    #                  RRC_HLSERVICE is set
+    #                o ${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )) otherwise
+    #              * RRC_RIGHTBUDDY_HOSTNAME: The current instance's right buddy FQHN. 
+    #                This var is for informational purposes only Possible values:
+    #                o ${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )).${RRC_HLSERVICE}, if 
+    #                  RRC_HLSERVICE is set
+    #                o ${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )) otherwise
+    # Usage:       source rrc-env  
+    #
+    ################################################################################
+    export RRC_HOSTNAME=${RRC_HOSTNAME:-${HOSTNAME}}
+    export RRC_SERVERID_OFFSET=${RRC_SERVERID_OFFSET:-10}
+    export RRC_CLONEPORT=${RRC_CLONEPORT:-3307}
+    export RRC_SOURCE_HOSTNAME=""
+    export RRC_REPLICA_HOSTNAME=""
+    export RRC_LEFTBUDDY_HOSTNAME=""
+    export RRC_RIGHTBUDDY_HOSTNAME=""
+    export RRC_STSNAME=""
+    export RRC_ORDINAL=""
+    export MYSQL_SOURCE_SERVICE_NAME=""
+
+    if [[ ${RRC_HOSTNAME} =~ ^(.*)-([0-9]+)$ ]] 
+    then
+      
+      # Hostname is correct (Compatible with StatefulSet naming convention)
+      RRC_STSNAME=${BASH_REMATCH[1]}
+      RRC_ORDINAL=${BASH_REMATCH[2]}
+      if [ -z "${RRC_HLSERVICE}" ] 
+      then
+          RRC_SOURCE_HOSTNAME="${RRC_STSNAME}-0"
+          RRC_RIGHTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL + 1 ))"
+          if [ ${RRC_ORDINAL} != 0 ] 
+          then
+            RRC_REPLICA_HOSTNAME="${RRC_STSNAME}-${RRC_ORDINAL}"
+            RRC_LEFTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL - 1 ))"
+          fi
+      else
+          RRC_SOURCE_HOSTNAME="${RRC_STSNAME}-0.${RRC_HLSERVICE}"
+          RRC_RIGHTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )).${RRC_HLSERVICE}"
+          if [ ${RRC_ORDINAL} != 0 ] 
+          then
+            RRC_REPLICA_HOSTNAME="${RRC_STSNAME}-${RRC_ORDINAL}.${RRC_HLSERVICE}"
+            RRC_LEFTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )).${RRC_HLSERVICE}"
+          fi
+      fi
+      MYSQL_SOURCE_SERVICE_NAME=${RRC_SOURCE_HOSTNAME}
+    fi
+  rrc-instance-alive: |-
+    #!/bin/bash
+    exec mysqladmin ping -uroot -p${MYSQL_ROOT_PASSWORD} 2>&1
+  rrc-instance-ready: |-
+    #!/bin/bash
+    exec mysql -u${MYSQL_BACKUP_USER} -p${MYSQL_BACKUP_PASSWORD} -h127.0.0.1 -e "SELECT 1;" 2>&1
+  rrc-run-mysqld: |-
+    #!/bin/bash
+    ################################################################################
+    #
+    # Script:      rrc-run-mysqld
+    # Maintainer:  jnmalledo@gmail.com
+    # Version:     1.0
+    # Description: Alternative to Red Hat provided MySQL init options. It source
+    #              the script rcc-env to setup RRC context, and execute the 
+    #              appropriate script for either source or replica instance types
+    # Usage:       rrc-run-mysqld
+    #
+    ################################################################################
+    export RRC_BASE=${RRC_BASE:-/opt/rrc}
+    source ${RRC_BASE}/rrc-env
+
+    if [ -z "${RRC_SOURCE_HOSTNAME}" ] 
+    then
+      echo "RRC ERROR: incorrect hostname '${RRC_HOSTNAME}'. This pod doesn't seem to be created from an StatefulSet resource. Aborting startup"
+      exit 1
+    fi
+
+    if [ ${RRC_ORDINAL} = 0 ] 
+    then
+      echo "RRC INFO: Source instance (${RRC_HOSTNAME}). Executing startup string ${RRC_BASE}/rrc-run-mysqld-source" 
+      exec "${RRC_BASE}/rrc-run-mysqld-source"
+    fi
+    echo "RRC INFO: Replica instance (${RRC_HOSTNAME}). Executing startup script ${RRC_BASE}/rrc-run-mysqld-replica" 
+    exec "${RRC_BASE}/rrc-run-mysqld-replica"
+  rrc-run-mysqld-replica: |-
+    #!/bin/bash
+    #
+    # This is an entrypoint that runs the MySQL server in the 'replica' mode.
+    #
+
+    export_vars=$(cgroup-limits); export $export_vars
+    source ${CONTAINER_SCRIPTS_PATH}/common.sh
+    set -eu
+    if [[ -v DEBUG_IGNORE_SCRIPT_FAILURES ]]; then
+      set +e
+    fi
+
+    export_setting_variables
+
+    log_volume_info $MYSQL_DATADIR
+
+    export MYSQL_RUNNING_AS_REPLICA=1
+    # use previously used value for compatibility
+    export MYSQL_RUNNING_AS_SLAVE=1
+
+    # Generate the unique 'server-id' for this source
+    # RRC 
+    #export MYSQL_SERVER_ID=$(server_id)
+    export MYSQL_SERVER_ID=$(( RRC_SERVERID_OFFSET + RRC_ORDINAL ))
+    log_info "The 'replica' server-id is ${MYSQL_SERVER_ID}"
+
+    # pre-init files
+    process_extending_files ${APP_DATA}/mysql-pre-init/ ${CONTAINER_SCRIPTS_PATH}/pre-init/
+
+    if [ ! -e "${MYSQL_DATADIR}/mysql" ]; then
+      # Initialize MySQL database and wait for the MySQL source to accept
+      # connections.
+      initialize_database "$@"
+      wait_for_mysql_source
+
+    # RRC
+    #  mysql $mysql_flags <<EOSQL
+    #  CHANGE REPLICATION SOURCE TO SOURCE_HOST='${MYSQL_SOURCE_SERVICE_NAME}',SOURCE_USER='${MYSQL_SOURCE_USER}', SOURCE_PASSWORD='${MYSQL_SOURCE_PASSWORD}', SOURCE_AUTO_POSITION = 1;
+    #EOSQL
+
+
+      # init files
+      process_extending_files ${APP_DATA}/mysql-init/ ${CONTAINER_SCRIPTS_PATH}/init/
+
+      # Restart the MySQL server with public IP bindings
+      shutdown_local_mysql
+    fi
+
+    unset_env_vars
+    log_volume_info $MYSQL_DATADIR
+
+    # RRC
+    echo "RRC INFO: Setting database as read only and disabling auto replica startup..."
+    #printf "super-read-only\nskip-slave-start\n" >> /etc/my.cnf.d/replica.cnf
+    echo "super-read-only" >> /etc/my.cnf.d/replica.cnf
+
+    log_info 'Running final exec -- Only MySQL server logs after this point'
+    exec ${MYSQL_PREFIX}/libexec/mysqld --defaults-file=$MYSQL_DEFAULTS_FILE \
+      --report-host=$(hostname -I) "$@" 2>&1
+  rrc-run-mysqld-source: |-
+    #!/bin/bash
+    #
+    # This is an entrypoint that runs the MySQL server in the 'source' mode.
+    #
+
+    export_vars=$(cgroup-limits); export $export_vars
+    source ${CONTAINER_SCRIPTS_PATH}/common.sh
+    set -eu
+    if [[ -v DEBUG_IGNORE_SCRIPT_FAILURES ]]; then
+      set +e
+    fi
+
+    export_setting_variables
+
+    log_volume_info $MYSQL_DATADIR
+
+    export MYSQL_RUNNING_AS_SOURCE=1
+    # use previously used value for compatibility
+    export MYSQL_RUNNING_AS_MASTER=1
+
+    # The 'server-id' for source needs to be constant
+    # RRC
+    #export MYSQL_SERVER_ID=1
+    export MYSQL_SERVER_ID=${RRC_SERVERID_OFFSET}
+    log_info "The 'source' server-id is ${MYSQL_SERVER_ID}"
+
+    # pre-init files
+    process_extending_files ${APP_DATA}/mysql-pre-init/ ${CONTAINER_SCRIPTS_PATH}/pre-init/
+
+    if [ ! -d "$MYSQL_DATADIR/mysql" ]; then
+      initialize_database "$@"
+    else
+      start_local_mysql "$@"
+    fi
+
+    log_info 'Setting passwords ...'
+    [ -f ${CONTAINER_SCRIPTS_PATH}/passwd-change.sh ] && source ${CONTAINER_SCRIPTS_PATH}/passwd-change.sh
+
+    # Setup the 'source' replication user and 'backup' user on the MySQL server
+    echo "RRC INFO: Creating core users"
+    mysql $mysql_flags <<EOSQL
+      CREATE USER IF NOT EXISTS '${MYSQL_SOURCE_USER}'@'%' IDENTIFIED BY '${MYSQL_SOURCE_PASSWORD}';
+      GRANT REPLICATION SLAVE ON *.* TO '${MYSQL_SOURCE_USER}'@'%';
+      CREATE USER IF NOT EXISTS '${MYSQL_BACKUP_USER}'@'%' IDENTIFIED BY '${MYSQL_BACKUP_PASSWORD}';
+      GRANT BACKUP_ADMIN, PROCESS, RELOAD, LOCK TABLES, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN ON *.* TO '${MYSQL_BACKUP_USER}'@'%';
+      GRANT SELECT ON performance_schema.log_status TO '${MYSQL_BACKUP_USER}'@'%';
+      GRANT SELECT ON performance_schema.keyring_component_status TO '${MYSQL_BACKUP_USER}'@'%';
+      GRANT SELECT ON performance_schema.replication_group_members TO '${MYSQL_BACKUP_USER}'@'%';
+      FLUSH PRIVILEGES;
+    EOSQL
+
+    # init files
+    process_extending_files ${APP_DATA}/mysql-init/ ${CONTAINER_SCRIPTS_PATH}/init/
+
+    # Restart the MySQL server with public IP bindings
+    shutdown_local_mysql
+    unset_env_vars
+    log_volume_info $MYSQL_DATADIR
+    log_info 'Running final exec -- Only MySQL server logs after this point'
+    exec ${MYSQL_PREFIX}/libexec/mysqld --defaults-file=$MYSQL_DEFAULTS_FILE "$@" 2>&1

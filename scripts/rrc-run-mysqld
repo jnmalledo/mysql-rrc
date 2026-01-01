@@ -1,0 +1,28 @@
+#!/bin/bash
+################################################################################
+#
+# Script:      rrc-run-mysqld
+# Maintainer:  jnmalledo@gmail.com
+# Version:     1.0
+# Description: Alternative to Red Hat provided MySQL init options. It source
+#              the script rcc-env to setup RRC context, and execute the 
+#              appropriate script for either source or replica instance types
+# Usage:       rrc-run-mysqld
+#
+################################################################################
+export RRC_BASE=${RRC_BASE:-/opt/rrc}
+source ${RRC_BASE}/rrc-env
+
+if [ -z "${RRC_SOURCE_HOSTNAME}" ] 
+then
+   echo "RRC ERROR: incorrect hostname '${RRC_HOSTNAME}'. This pod doesn't seem to be created from an StatefulSet resource. Aborting startup"
+   exit 1
+fi
+
+if [ ${RRC_ORDINAL} = 0 ] 
+then
+   echo "RRC INFO: Source instance (${RRC_HOSTNAME}). Executing startup string ${RRC_BASE}/rrc-run-mysqld-source" 
+   exec "${RRC_BASE}/rrc-run-mysqld-source"
+fi
+echo "RRC INFO: Replica instance (${RRC_HOSTNAME}). Executing startup script ${RRC_BASE}/rrc-run-mysqld-replica" 
+exec "${RRC_BASE}/rrc-run-mysqld-replica"

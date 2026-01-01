@@ -1,0 +1,119 @@
+#!/bin/bash
+################################################################################
+#
+# Script:      rrc-post
+# Maintainer:  jnmalledo@gmail.com
+# Version:     1.0
+# Description: This script should be executed after the MySQL instance starts
+#              and only has effect in replica instance pods. If an initial 
+#              cloning is needed, it connects to its "left buddy" pod to
+#              get a consistent state of its data files (using the xbstream 
+#              command), and placed them onto the MYSQL_DATADIR directory 
+#              (usually /var/lib/mysql). If this operation is successful, it 
+#              prepare datafiles to be served to the 'right buddy' pod (using
+#              the xtrabackup command)
+# Descripción: Escucha por el puerto de clonación a que se produzca alguna
+#              solicitud para clonar la base de datos. Esta solicitud, de 
+#              producirse, siempre vendrá del "compi de la derecha"
+# Entorno:     * MYSQL_CLONEPORT. Puerto en el que el servidor de clonación
+#                está escuchando. Valor por defecto: 3307
+#              * MYSQL_ROOT_PASSWORD. Contraseña del usuario de clonado
+#
+# Uso:         clone-server.sh
+#
+################################################################################
+export RRC_BASE=${RRC_BASE:-/opt/rrc}
+export MYSQL_DATADIR=${MYSQL_DATADIR:-/var/lib/mysql/data}
+source ${RRC_BASE}/rrc-env
+
+# Check if RRC_SOURCE_HOSTNAME variable is empty. If so, STS_HOSTNAME is
+# incorrect
+if [ -z "${RRC_SOURCE_HOSTNAME}" ] 
+then
+   echo "RRC ERROR: incorrect hostname '${RRC_HOSTNAME}'. This pod doesn't seem to be created from an StatefulSet resource. Aborting startup"
+   exit 1
+fi
+
+cd ${MYSQL_DATADIR}
+echo "RRC INFO: Getting cloned position data (if any)"
+ # Determine binlog position of cloned data, if any, into the change_replication_source_to.sql.in file
+ # This process only apply to replica instances
+
+if [ -s xtrabackup_slave_info ] 
+then
+
+   # XtraBackup already generated a partial "CHANGE MASTER TO" query
+   # because we're cloning from an existing replica. 
+   # File xtrabackup_slave_info can be used, but we need to remove the tailing semicolon as
+   # we'll add some more things. Also, we need to replace previous 'MASTER' naming with the new 'SOURCE'
+   echo "RRC INFO: xtrabackup_slave_info file found. Content:"
+   cat xtrabackup_slave_info
+   cat xtrabackup_slave_info | sed -e 's/CHANGE MASTER TO/CHANGE REPLICATION SOURCE TO/' -e 's/MASTER/SOURCE/g' -e 's/;$//g' > change_replication_source_to.sql.in
+
+   # change_replication_source_to.sql.in file generated. Don't need the 
+   # xtrabackup_slave_info and/or xtrabackup_binlog_info anymore
+   rm -f xtrabackup_slave_info xtrabackup_binlog_info
+elif [ -s xtrabackup_binlog_info ]
+then
+
+   if [[ $(cat xtrabackup_binlog_info) =~ ^(.*?)[[:space:]]+(.*?)[[:space:]]+(.*?)$ ]]
+   then
+      sourceLogFile=${BASH_REMATCH[1]}
+      sourceLogPos=${BASH_REMATCH[2]}
+      sourceGTID=${BASH_REMATCH[3]}
+      echo "RRC INFO: xtrabackup_slave_info file found. Content:"
+      cat xtrabackup_binlog_info
+      echo "CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='${sourceLogFile}',SOURCE_LOG_POS=${sourceLogPos}" > change_replication_source_to.sql.in
+
+      # change_replication_source_to.sql.in file generated. Don't need the 
+      # xtrabackup_slave_info and/or xtrabackup_binlog_info anymore
+      rm -f xtrabackup_slave_info xtrabackup_binlog_info
+   else
+      echo "RRC ERROR: Incorrect format for the xtrabackup_binlog_info file (GTID should be enabled)"
+      exit 1
+   fi
+fi
+
+# Since this container may be executed while MySQL instance is starting, we need to
+# wait until it's ready to accept connections
+echo "RRC INFO: Waiting for local mysqld to accept connections..."
+until mysql -u${MYSQL_BACKUP_USER} -p${MYSQL_BACKUP_PASSWORD} -h127.0.0.1 -e "SELECT 1" >/dev/null 2>&1
+do
+   sleep 1
+done
+echo "RRC INFO: Instance ready at localhost!"
+
+# Check if we need to complete a clone by starting replication.
+# As we stand before, this process only takes place in replicas
+if [ -f change_replication_source_to.sql.in ]
+then
+   
+   # Replica instance
+   echo "RRC INFO: Starting replication from clone position"
+   mysql -u${MYSQL_BACKUP_USER} -p${MYSQL_BACKUP_PASSWORD} -h127.0.0.1 -e " \
+      STOP REPLICA;
+      RESET REPLICA ALL;
+      $(<change_replication_source_to.sql.in), \
+      SOURCE_HOST='${RRC_SOURCE_HOSTNAME}', \
+      SOURCE_USER='${MYSQL_SOURCE_USER}', \
+      SOURCE_PASSWORD='${MYSQL_SOURCE_PASSWORD}', \
+      SOURCE_CONNECT_RETRY=10, \
+      GET_SOURCE_PUBLIC_KEY=1; \
+      START REPLICA;"
+   if [ $? != 0 ]
+   then
+      echo "RRC ERROR: failed starting replication. Aborting"
+      exit 1
+   fi
+
+   # In case of container restart, attempt this at-most-once.
+   mv change_replication_source_to.sql.in change_replication_source_to.sql.orig
+else
+
+   # Source instance
+   echo "RRC INFO: This is the source instance. No replication needed"
+fi
+
+# Start a server to send backups when requested by right buddy.
+echo "RRC INFO: Executing clone server in port ${RRC_CLONEPORT}. Backup will be served to my 'right buddy' (${RRC_RIGHTBUDDY_HOSTNAME})"
+exec ncat --listen --keep-open --send-only --max-conns=1 ${RRC_CLONEPORT} -c "xtrabackup --backup  --slave-info --safe-slave-backup --stream=xbstream --host=127.0.0.1 --user='${MYSQL_BACKUP_USER}' --password='${MYSQL_BACKUP_PASSWORD}'"

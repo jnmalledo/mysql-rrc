@@ -1,0 +1,1396 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+labels:
+  app: ${RRC_NAME}
+  app.kubernetes.io/name: ${RRC_NAME}
+message: "MySQL Read Replica Cluster based on Kubernetes StatefulSet"
+metadata:
+  name: mysql-rrc
+objects: 
+
+################################################################################
+# Secret:      mysql-creds
+# Description: Environment variables:
+# Variables:   * MYSQL_ROOT_PASSWORD: Instances password for the root user
+#              * MYSQL_USER: Instance user name for user database
+#              * MYSQL_PASSWORD: Instance user password
+#              * MYSQL_DATABASE: Name of the user database
+#              * MYSQL_SOURCE_USER: This user is for replication purposes, 
+#                avoiding using root credentials
+#              * MYSQL_SOURCE_PASSWORD: Replication user password
+#              * MYSQL_BACKUP_USER: This user is for clone purposes, avoiding
+#                using root credentials
+#              * MYSQL_BACKUP_PASSWORD: Backup user password
+#              * RRC_HLSERVICE: Name of the headless service
+# Files:       None
+################################################################################
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+  type: Opaque
+  stringData:
+    MYSQL_ROOT_PASSWORD: ${RRC_MYSQL_ROOT_PASSWORD}
+    MYSQL_USER: ${RRC_MYSQL_USER}
+    MYSQL_PASSWORD: ${RRC_MYSQL_PASSWORD}
+    MYSQL_DATABASE: ${RRC_MYSQL_DATABASE}
+    MYSQL_SOURCE_USER: ${RRC_MYSQL_SOURCE_USER}
+    MYSQL_SOURCE_PASSWORD: ${RRC_MYSQL_SOURCE_PASSWORD}
+    MYSQL_BACKUP_USER: ${RRC_MYSQL_BACKUP_USER}
+    MYSQL_BACKUP_PASSWORD: ${RRC_MYSQL_BACKUP_PASSWORD}
+    RRC_HLSERVICE: ${RRC_HEADLESS_SERVICE_NAME}
+
+################################################################################
+# Secret:      rh-registry-creds
+# Description: Image pull secret for private registry. Needed for container 
+#              image pull
+# Variables:   None
+# Files:       * .dockerconfigjson: Docker config file, in json format
+################################################################################
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: ${RRC_IMAGE_PULL_SECRET_NAME}
+  type: kubernetes.io/dockerconfigjson
+  stringData:
+    .dockerconfigjson: |-
+      {
+        "auths": {
+          "${RRC_PRIVATE_REGISTRY_URL}": {
+            "auth": "${RRC_PRIVATE_REGISTRY_AUTH_TOKEN}"
+          }
+        }
+      }
+
+################################################################################
+# Configmap:   rrc-scripts
+# Description: MySQL RRC scripts. Execution of either Source or Replica role,
+#              depending on the StatefulSet pod ordinal
+# Variables:   None
+# Files:       * rrc-env: Set the RRC context using environment variables
+#              * rrc-run-mysqld: RRC container entry-point
+#              * rrc-run-mysqld-source: Called by RRC container entry-point
+#                when pod ordinal = 0
+#              * rrc-run-mysqld-replica: Called by RRC container entry-point
+#                when pod ordinal > 0
+#              * rrc-instance-alive: For liveness probe 
+#              * rrc-instance-ready: For readiness probe
+################################################################################
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${RRC_SCRIPTS_CONFIGMAP_NAME}
+  data:
+    rrc-env: |-
+      #!/bin/bash
+      ################################################################################
+      #
+      # Script:      rrc-env
+      # Maintainer:  jnmalledo@gmail.com
+      # Version:     1.0
+      # Description: Set the StatefulSet-based Read Replica Cluster (RRC) environment
+      #              variables. If STS_HOSTNAME doesn't follow the StatefulSet 
+      #              naming convention, the following variables will be set to ""
+      #              * RRC_SOURCE_HOSTNAME
+      #              * RRC_REPLICA_HOSTNAME
+      #              * RRC_LEFTBUDDY_HOSTNAME
+      #              * RRC_RIGHTBUDDY_HOSTNAME
+      # Environment: The following variables are set by this script:
+      #              * RRC_HOSTNAME: Pod name that override the official hostname
+      #                Default: HOSTNAME (env var)
+      #              * RRC_SERVERID_OFFSET: Offset to be added to the StatefulSet pod
+      #                name's ordinal value to setup server_id global instance var.
+      #                It's used to avoid reserved value "0" for this variable
+      #                Default: 10
+      #              * RRC_CLONEPORT: Port in which current instance's "left buddy"
+      #                should be listening for initial clone requests
+      #                Default: 3307
+      #              * RRC_HLSERVICE: Name of the headless kubernetes service used
+      #                to access pods in a discretional way. This is needed to access
+      #                the source host (for example, mysql-0.interconnect) or the 
+      #                "left buddy" (mysql-1.interconnect, left buddy of mysql-2). 
+      #                This value is optional while working in "container mode" 
+      #                (docker or podman), but required while working in Kubernetes
+      #              * RRC_STSNAME: StatefulSet name. Obtained from STS_HOSTNAME 
+      #                variable, it's the first token before the final -number 
+      #                pattern. For example, if STS_HOSTNAME=mysql-80-3, RRC_STSNAME
+      #                is 'mysql-80'
+      #              * RRC_ORDINAL: Ordinal name. Obtained from STS_HOSTNAME 
+      #                variable, it's the second token of the final -number 
+      #                pattern. For example, if STS_HOSTNAME=mysql-80-3, RRC_ORDINAL
+      #                is '3'              
+      #              * RRC_SOURCE_HOSTNAME: Source instance FQHN. Possible values:
+      #                o ${RRC_STSNAME}-0.${RRC_HLSERVICE}, if RRC_HLSERVICE is set
+      #                o ${RRC_STSNAME}-0 otherwise
+      #              * RRC_REPLICA_HOSTNAME: Replica instance FQHN. Possible values:
+      #                o "", if RRC_ORDINAL is 0
+      #                o ${RRC_STSNAME}-${RRC_ORDINAL}.${RRC_HLSERVICE}, if 
+      #                  RRC_HLSERVICE is set
+      #                o ${RRC_STSNAME}-${RRC_ORDINAL} otherwise
+      #              * RRC_LEFTBUDDY_HOSTNAME: The current instance's left buddy FQHN. 
+      #                Possible values:
+      #                o "", if RRC_ORDINAL is 0
+      #                o ${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )).${RRC_HLSERVICE}, if 
+      #                  RRC_HLSERVICE is set
+      #                o ${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )) otherwise
+      #              * RRC_RIGHTBUDDY_HOSTNAME: The current instance's right buddy FQHN. 
+      #                This var is for informational purposes only Possible values:
+      #                o ${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )).${RRC_HLSERVICE}, if 
+      #                  RRC_HLSERVICE is set
+      #                o ${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )) otherwise
+      # Usage:       source rrc-env  
+      #
+      ################################################################################
+      export RRC_HOSTNAME=${RRC_HOSTNAME:-${HOSTNAME}}
+      export RRC_SERVERID_OFFSET=${RRC_SERVERID_OFFSET:-10}
+      export RRC_CLONEPORT=${RRC_CLONEPORT:-3307}
+      export RRC_SOURCE_HOSTNAME=""
+      export RRC_REPLICA_HOSTNAME=""
+      export RRC_LEFTBUDDY_HOSTNAME=""
+      export RRC_RIGHTBUDDY_HOSTNAME=""
+      export RRC_STSNAME=""
+      export RRC_ORDINAL=""
+      export MYSQL_SOURCE_SERVICE_NAME=""
+
+      if [[ ${RRC_HOSTNAME} =~ ^(.*)-([0-9]+)$ ]] 
+      then
+        
+        # Hostname is correct (Compatible with StatefulSet naming convention)
+        RRC_STSNAME=${BASH_REMATCH[1]}
+        RRC_ORDINAL=${BASH_REMATCH[2]}
+        if [ -z "${RRC_HLSERVICE}" ] 
+        then
+            RRC_SOURCE_HOSTNAME="${RRC_STSNAME}-0"
+            RRC_RIGHTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL + 1 ))"
+            if [ ${RRC_ORDINAL} != 0 ] 
+            then
+              RRC_REPLICA_HOSTNAME="${RRC_STSNAME}-${RRC_ORDINAL}"
+              RRC_LEFTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL - 1 ))"
+            fi
+        else
+            RRC_SOURCE_HOSTNAME="${RRC_STSNAME}-0.${RRC_HLSERVICE}"
+            RRC_RIGHTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL + 1 )).${RRC_HLSERVICE}"
+            if [ ${RRC_ORDINAL} != 0 ] 
+            then
+              RRC_REPLICA_HOSTNAME="${RRC_STSNAME}-${RRC_ORDINAL}.${RRC_HLSERVICE}"
+              RRC_LEFTBUDDY_HOSTNAME="${RRC_STSNAME}-$(( RRC_ORDINAL - 1 )).${RRC_HLSERVICE}"
+            fi
+        fi
+        MYSQL_SOURCE_SERVICE_NAME=${RRC_SOURCE_HOSTNAME}
+      fi
+    rrc-instance-alive: |-
+      #!/bin/bash
+      exec mysqladmin ping -uroot -p${MYSQL_ROOT_PASSWORD} 2>&1
+    rrc-instance-ready: |-
+      #!/bin/bash
+      exec mysql -u${MYSQL_BACKUP_USER} -p${MYSQL_BACKUP_PASSWORD} -h127.0.0.1 -e "SELECT 1;" 2>&1
+    rrc-run-mysqld: |-
+      #!/bin/bash
+      ################################################################################
+      #
+      # Script:      rrc-run-mysqld
+      # Maintainer:  jnmalledo@gmail.com
+      # Version:     1.0
+      # Description: Alternative to Red Hat provided MySQL init options. It source
+      #              the script rcc-env to setup RRC context, and execute the 
+      #              appropriate script for either source or replica instance types
+      # Usage:       rrc-run-mysqld
+      #
+      ################################################################################
+      export RRC_BASE=${RRC_BASE:-/opt/rrc}
+      source ${RRC_BASE}/rrc-env
+
+      if [ -z "${RRC_SOURCE_HOSTNAME}" ] 
+      then
+        echo "RRC ERROR: incorrect hostname '${RRC_HOSTNAME}'. This pod doesn't seem to be created from an StatefulSet resource. Aborting startup"
+        exit 1
+      fi
+
+      if [ ${RRC_ORDINAL} = 0 ] 
+      then
+        echo "RRC INFO: Source instance (${RRC_HOSTNAME}). Executing startup string ${RRC_BASE}/rrc-run-mysqld-source" 
+        exec "${RRC_BASE}/rrc-run-mysqld-source"
+      fi
+      echo "RRC INFO: Replica instance (${RRC_HOSTNAME}). Executing startup script ${RRC_BASE}/rrc-run-mysqld-replica" 
+      exec "${RRC_BASE}/rrc-run-mysqld-replica"
+    rrc-run-mysqld-replica: |-
+      #!/bin/bash
+      #
+      # This is an entrypoint that runs the MySQL server in the 'replica' mode.
+      #
+
+      export_vars=$(cgroup-limits); export $export_vars
+      source ${CONTAINER_SCRIPTS_PATH}/common.sh
+      set -eu
+      if [[ -v DEBUG_IGNORE_SCRIPT_FAILURES ]]; then
+        set +e
+      fi
+
+      export_setting_variables
+
+      log_volume_info $MYSQL_DATADIR
+
+      export MYSQL_RUNNING_AS_REPLICA=1
+      # use previously used value for compatibility
+      export MYSQL_RUNNING_AS_SLAVE=1
+
+      # Generate the unique 'server-id' for this source
+      # RRC 
+      #export MYSQL_SERVER_ID=$(server_id)
+      export MYSQL_SERVER_ID=$(( RRC_SERVERID_OFFSET + RRC_ORDINAL ))
+      log_info "The 'replica' server-id is ${MYSQL_SERVER_ID}"
+
+      # pre-init files
+      process_extending_files ${APP_DATA}/mysql-pre-init/ ${CONTAINER_SCRIPTS_PATH}/pre-init/
+
+      if [ ! -e "${MYSQL_DATADIR}/mysql" ]; then
+        # Initialize MySQL database and wait for the MySQL source to accept
+        # connections.
+        initialize_database "$@"
+        wait_for_mysql_source
+
+      # RRC
+      #  mysql $mysql_flags <<EOSQL
+      #  CHANGE REPLICATION SOURCE TO SOURCE_HOST='${MYSQL_SOURCE_SERVICE_NAME}',SOURCE_USER='${MYSQL_SOURCE_USER}', SOURCE_PASSWORD='${MYSQL_SOURCE_PASSWORD}', SOURCE_AUTO_POSITION = 1;
+      #EOSQL
+
+
+        # init files
+        process_extending_files ${APP_DATA}/mysql-init/ ${CONTAINER_SCRIPTS_PATH}/init/
+
+        # Restart the MySQL server with public IP bindings
+        shutdown_local_mysql
+      fi
+
+      unset_env_vars
+      log_volume_info $MYSQL_DATADIR
+
+      # RRC
+      echo "RRC INFO: Setting database as read only and disabling auto replica startup..."
+      #printf "super-read-only\nskip-slave-start\n" >> /etc/my.cnf.d/replica.cnf
+      echo "super-read-only" >> /etc/my.cnf.d/replica.cnf
+
+      log_info 'Running final exec -- Only MySQL server logs after this point'
+      exec ${MYSQL_PREFIX}/libexec/mysqld --defaults-file=$MYSQL_DEFAULTS_FILE \
+        --report-host=$(hostname -I) "$@" 2>&1
+    rrc-run-mysqld-source: |-
+      #!/bin/bash
+      #
+      # This is an entrypoint that runs the MySQL server in the 'source' mode.
+      #
+
+      export_vars=$(cgroup-limits); export $export_vars
+      source ${CONTAINER_SCRIPTS_PATH}/common.sh
+      set -eu
+      if [[ -v DEBUG_IGNORE_SCRIPT_FAILURES ]]; then
+        set +e
+      fi
+
+      export_setting_variables
+
+      log_volume_info $MYSQL_DATADIR
+
+      export MYSQL_RUNNING_AS_SOURCE=1
+      # use previously used value for compatibility
+      export MYSQL_RUNNING_AS_MASTER=1
+
+      # The 'server-id' for source needs to be constant
+      # RRC
+      #export MYSQL_SERVER_ID=1
+      export MYSQL_SERVER_ID=${RRC_SERVERID_OFFSET}
+      log_info "The 'source' server-id is ${MYSQL_SERVER_ID}"
+
+      # pre-init files
+      process_extending_files ${APP_DATA}/mysql-pre-init/ ${CONTAINER_SCRIPTS_PATH}/pre-init/
+
+      if [ ! -d "$MYSQL_DATADIR/mysql" ]; then
+        initialize_database "$@"
+      else
+        start_local_mysql "$@"
+      fi
+
+      log_info 'Setting passwords ...'
+      [ -f ${CONTAINER_SCRIPTS_PATH}/passwd-change.sh ] && source ${CONTAINER_SCRIPTS_PATH}/passwd-change.sh
+
+      # Setup the 'source' replication user and 'backup' user on the MySQL server
+      echo "RRC INFO: Creating core users"
+      mysql $mysql_flags <<EOSQL
+        CREATE USER IF NOT EXISTS '${MYSQL_SOURCE_USER}'@'%' IDENTIFIED BY '${MYSQL_SOURCE_PASSWORD}';
+        GRANT REPLICATION SLAVE ON *.* TO '${MYSQL_SOURCE_USER}'@'%';
+        CREATE USER IF NOT EXISTS '${MYSQL_BACKUP_USER}'@'%' IDENTIFIED BY '${MYSQL_BACKUP_PASSWORD}';
+        GRANT BACKUP_ADMIN, PROCESS, RELOAD, LOCK TABLES, REPLICATION CLIENT, REPLICATION_SLAVE_ADMIN ON *.* TO '${MYSQL_BACKUP_USER}'@'%';
+        GRANT SELECT ON performance_schema.log_status TO '${MYSQL_BACKUP_USER}'@'%';
+        GRANT SELECT ON performance_schema.keyring_component_status TO '${MYSQL_BACKUP_USER}'@'%';
+        GRANT SELECT ON performance_schema.replication_group_members TO '${MYSQL_BACKUP_USER}'@'%';
+        FLUSH PRIVILEGES;
+      EOSQL
+
+      # init files
+      process_extending_files ${APP_DATA}/mysql-init/ ${CONTAINER_SCRIPTS_PATH}/init/
+
+      # Restart the MySQL server with public IP bindings
+      shutdown_local_mysql
+      unset_env_vars
+      log_volume_info $MYSQL_DATADIR
+      log_info 'Running final exec -- Only MySQL server logs after this point'
+      exec ${MYSQL_PREFIX}/libexec/mysqld --defaults-file=$MYSQL_DEFAULTS_FILE "$@" 2>&1
+
+################################################################################
+# Configmap:   dbdump
+# Description: A small database dump for testing purposes
+# Variables:   None
+# Files:       * db.dump: animal database dump
+################################################################################
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    labels:
+      app: mysql
+      app.kubernetes.io/name: mysql
+    name: dbdump
+  data:
+    db.dump: "-- MySQL dump 10.14  Distrib 5.5.40-MariaDB, for Linux (x86_64)\n--\n--
+      Host: localhost    Database: animales\n-- ------------------------------------------------------\n--
+      Server version\t5.5.40-MariaDB\n\n/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT
+      */;\n/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;\n/*!40101
+      SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;\n/*!40101 SET NAMES utf8
+      */;\n/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;\n/*!40103 SET TIME_ZONE='+00:00'
+      */;\n/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */;\n/*!40014
+      SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;\n/*!40101
+      SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;\n/*!40111 SET
+      @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;\n\n--\n-- Table structure for table
+      `common_names`\n--\n\nDROP TABLE IF EXISTS `common_names`;\n/*!40101 SET @saved_cs_client
+      \    = @@character_set_client */;\n/*!40101 SET character_set_client = utf8 */;\nCREATE
+      TABLE `common_names` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  `name` tinytext,\n
+      \ PRIMARY KEY (`id`)\n) ENGINE=InnoDB AUTO_INCREMENT=1739526643 DEFAULT CHARSET=latin1;\n/*!40101
+      SET character_set_client = @saved_cs_client */;\n\n--\n-- Dumping data for table
+      `common_names`\n--\n\nLOCK TABLES `common_names` WRITE;\n/*!40000 ALTER TABLE
+      `common_names` DISABLE KEYS */;\nINSERT INTO `common_names` VALUES (1739526052,'Abyssinian'),(1739526053,'Adelie
+      Penguin'),(1739526054,'Affenpinscher'),(1739526055,'Afghan Hound'),(1739526056,'African
+      Bush Elephant'),(1739526057,'African Civet'),(1739526058,'African Clawed Frog'),(1739526059,'African
+      Forest Elephant'),(1739526060,'African Palm Civet'),(1739526061,'African Penguin'),(1739526062,'African
+      Tree Toad'),(1739526063,'African Wild Dog'),(1739526064,'Ainu Dog'),(1739526065,'Airedale
+      Terrier '),(1739526066,'Akbash'),(1739526067,'Akita'),(1739526068,'Alaskan Malamute'),(1739526069,'Albatross'),(1739526070,'Aldabra
+      Giant Tortoise'),(1739526071,'Alligator'),(1739526072,'Alpine Dachsbracke'),(1739526073,'American
+      Bulldog'),(1739526074,'American Cocker Spaniel'),(1739526075,'American Coonhound'),(1739526076,'American
+      Eskimo Dog'),(1739526077,'American Foxhound'),(1739526078,'American Pit Bull Terrier'),(1739526079,'American
+      Staffordshire Terrier'),(1739526080,'American Water Spaniel'),(1739526081,'Anatolian
+      Shepherd Dog'),(1739526082,'Angelfish'),(1739526083,'Ant'),(1739526084,'Anteater'),(1739526085,'Antelope'),(1739526086,'Appenzeller
+      Dog'),(1739526087,'Arctic Fox'),(1739526088,'Arctic Hare'),(1739526089,'Arctic
+      Wolf'),(1739526090,'Armadillo'),(1739526091,'Asian Elephant'),(1739526092,'Asian
+      Giant Hornet'),(1739526093,'Asian Palm Civet'),(1739526094,'Asiatic Black Bear'),(1739526095,'Australian
+      Cattle Dog'),(1739526096,'Australian Kelpie Dog'),(1739526097,'Australian Mist'),(1739526098,'Australian
+      Shepherd'),(1739526099,'Australian Terrier'),(1739526100,'Avocet'),(1739526101,'Axolotl'),(1739526102,'Aye
+      Aye '),(1739526103,'Baboon'),(1739526104,'Bactrian Camel'),(1739526105,'Badger'),(1739526106,'Balinese'),(1739526107,'Banded
+      Palm Civet'),(1739526108,'Bandicoot'),(1739526109,'Barb'),(1739526110,'Barn Owl'),(1739526111,'Barnacle'),(1739526112,'Barracuda'),(1739526113,'Basenji
+      Dog'),(1739526114,'Basking Shark'),(1739526115,'Basset Hound'),(1739526116,'Bat'),(1739526117,'Bavarian
+      Mountain Hound'),(1739526118,'Beagle'),(1739526119,'Bear'),(1739526120,'Bearded
+      Collie'),(1739526121,'Bearded Dragon'),(1739526122,'Beaver'),(1739526123,'Bedlington
+      Terrier'),(1739526124,'Beetle'),(1739526125,'Bengal Tiger'),(1739526126,'Bernese
+      Mountain Dog'),(1739526127,'Bichon Frise'),(1739526128,'Binturong'),(1739526129,'Bird'),(1739526130,'Birds
+      Of Paradise'),(1739526131,'Birman'),(1739526132,'Bison'),(1739526133,'Black Bear'),(1739526134,'Black
+      Rhinoceros'),(1739526135,'Black Russian Terrier'),(1739526136,'Black Widow Spider'),(1739526137,'Bloodhound'),(1739526138,'Blue
+      Lacy Dog'),(1739526139,'Blue Whale'),(1739526140,'Bluetick Coonhound'),(1739526141,'Bobcat'),(1739526142,'Bolognese
+      Dog'),(1739526143,'Bombay'),(1739526144,'Bongo'),(1739526145,'Bonobo'),(1739526146,'Booby'),(1739526147,'Border
+      Collie'),(1739526148,'Border Terrier'),(1739526149,'Bornean Orang-utan'),(1739526150,'Borneo
+      Elephant'),(1739526151,'Boston Terrier'),(1739526152,'Bottle Nosed Dolphin'),(1739526153,'Boxer
+      Dog'),(1739526154,'Boykin Spaniel'),(1739526155,'Brazilian Terrier'),(1739526156,'Brown
+      Bear'),(1739526157,'Budgerigar'),(1739526158,'Buffalo'),(1739526159,'Bull Mastiff'),(1739526160,'Bull
+      Shark'),(1739526161,'Bull Terrier'),(1739526162,'Bulldog'),(1739526163,'Bullfrog'),(1739526164,'Bumble
+      Bee'),(1739526165,'Burmese'),(1739526166,'Burrowing Frog'),(1739526167,'Butterfly'),(1739526168,'Butterfly
+      Fish'),(1739526169,'Caiman'),(1739526170,'Caiman Lizard'),(1739526171,'Cairn Terrier'),(1739526172,'Camel'),(1739526173,'Canaan
+      Dog'),(1739526174,'Capybara'),(1739526175,'Caracal'),(1739526176,'Carolina Dog'),(1739526177,'Cassowary'),(1739526178,'Cat'),(1739526179,'Caterpillar'),(1739526180,'Catfish'),(1739526181,'Cavalier
+      King Charles Spaniel'),(1739526182,'Centipede'),(1739526183,'Cesky Fousek'),(1739526184,'Chameleon'),(1739526185,'Chamois'),(1739526186,'Cheetah'),(1739526187,'Chesapeake
+      Bay Retriever'),(1739526188,'Chicken'),(1739526189,'Chihuahua'),(1739526190,'Chimpanzee'),(1739526191,'Chinchilla'),(1739526192,'Chinese
+      Crested Dog'),(1739526193,'Chinook'),(1739526194,'Chinstrap Penguin'),(1739526195,'Chipmunk'),(1739526196,'Chow
+      Chow'),(1739526197,'Cichlid'),(1739526198,'Clouded Leopard'),(1739526199,'Clown
+      Fish'),(1739526200,'Clumber Spaniel'),(1739526201,'Coati'),(1739526202,'Cockroach'),(1739526203,'Collared
+      Peccary'),(1739526204,'Collie'),(1739526205,'Common Buzzard'),(1739526206,'Common
+      Frog'),(1739526207,'Common Loon'),(1739526208,'Common Toad'),(1739526209,'Coral'),(1739526210,'Cottontop
+      Tamarin'),(1739526211,'Cougar'),(1739526212,'Cow'),(1739526213,'Coyote'),(1739526214,'Crab'),(1739526215,'Crab-Eating
+      Macaque'),(1739526216,'Crane'),(1739526217,'Crested Penguin'),(1739526218,'Crocodile'),(1739526219,'Cross
+      River Gorilla'),(1739526220,'Curly Coated Retriever'),(1739526221,'Cuscus'),(1739526222,'Cuttlefish'),(1739526223,'Dachshund'),(1739526224,'Dalmatian'),(1739526225,'Darwins
+      Frog'),(1739526226,'Deer'),(1739526227,'Desert Tortoise'),(1739526228,'Deutsche
+      Bracke'),(1739526229,'Dhole'),(1739526230,'Dingo'),(1739526231,'Discus'),(1739526232,'Doberman
+      Pinscher'),(1739526233,'Dodo'),(1739526234,'Dog'),(1739526235,'Dogo Argentino'),(1739526236,'Dogue
+      De Bordeaux'),(1739526237,'Dolphin'),(1739526238,'Donkey'),(1739526239,'Dormouse'),(1739526240,'Dragonfly'),(1739526241,'Drever'),(1739526242,'Duck'),(1739526243,'Dugong'),(1739526244,'Dunker'),(1739526245,'Dusky
+      Dolphin'),(1739526246,'Dwarf Crocodile'),(1739526247,'Eagle'),(1739526248,'Earwig
+      '),(1739526249,'Eastern Gorilla'),(1739526250,'Eastern Lowland Gorilla'),(1739526251,'Echidna'),(1739526252,'Edible
+      Frog'),(1739526253,'Egyptian Mau'),(1739526254,'Electric Eel'),(1739526255,'Elephant'),(1739526256,'Elephant
+      Seal'),(1739526257,'Elephant Shrew'),(1739526258,'Emperor Penguin'),(1739526259,'Emperor
+      Tamarin'),(1739526260,'Emu'),(1739526261,'English Cocker Spaniel'),(1739526262,'English
+      Shepherd'),(1739526263,'English Springer Spaniel'),(1739526264,'Entlebucher Mountain
+      Dog'),(1739526265,'Epagneul Pont Audemer'),(1739526266,'Eskimo Dog'),(1739526267,'Estrela
+      Mountain Dog'),(1739526268,'Falcon'),(1739526269,'Fennec Fox'),(1739526270,'Ferret'),(1739526271,'Field
+      Spaniel'),(1739526272,'Fin Whale'),(1739526273,'Finnish Spitz'),(1739526274,'Fire-Bellied
+      Toad'),(1739526275,'Fish'),(1739526276,'Fishing Cat'),(1739526277,'Flamingo'),(1739526278,'Flat
+      Coat Retriever'),(1739526279,'Flounder'),(1739526280,'Fly'),(1739526281,'Flying
+      Squirrel'),(1739526282,'Fossa'),(1739526283,'Fox'),(1739526284,'Fox Terrier'),(1739526285,'French
+      Bulldog'),(1739526286,'Frigatebird'),(1739526287,'Frilled Lizard'),(1739526288,'Frog'),(1739526289,'Fur
+      Seal'),(1739526290,'Galapagos Penguin'),(1739526291,'Galapagos Tortoise'),(1739526292,'Gar'),(1739526293,'Gecko'),(1739526294,'Gentoo
+      Penguin'),(1739526295,'Geoffroys Tamarin'),(1739526296,'Gerbil'),(1739526297,'German
+      Pinscher'),(1739526298,'German Shepherd'),(1739526299,'Gharial'),(1739526300,'Giant
+      African Land Snail'),(1739526301,'Giant Clam'),(1739526302,'Giant Panda Bear'),(1739526303,'Giant
+      Schnauzer'),(1739526304,'Gibbon'),(1739526305,'Gila Monster'),(1739526306,'Giraffe'),(1739526307,'Glass
+      Lizard'),(1739526308,'Glow Worm'),(1739526309,'Goat'),(1739526310,'Golden Lion
+      Tamarin'),(1739526311,'Golden Oriole'),(1739526312,'Golden Retriever'),(1739526313,'Goose'),(1739526314,'Gopher'),(1739526315,'Gorilla'),(1739526316,'Grasshopper'),(1739526317,'Great
+      Dane'),(1739526318,'Great White Shark'),(1739526319,'Greater Swiss Mountain Dog'),(1739526320,'Green
+      Bee-Eater'),(1739526321,'Greenland Dog'),(1739526322,'Grey Mouse Lemur'),(1739526323,'Grey
+      Reef Shark'),(1739526324,'Grey Seal'),(1739526325,'Greyhound'),(1739526326,'Grizzly
+      Bear'),(1739526327,'Grouse'),(1739526328,'Guinea Fowl'),(1739526329,'Guinea Pig'),(1739526330,'Guppy'),(1739526331,'Hammerhead
+      Shark'),(1739526332,'Hamster'),(1739526333,'Hare'),(1739526334,'Harrier'),(1739526335,'Havanese'),(1739526336,'Hedgehog'),(1739526337,'Hercules
+      Beetle'),(1739526338,'Hermit Crab'),(1739526339,'Heron'),(1739526340,'Highland
+      Cattle'),(1739526341,'Himalayan'),(1739526342,'Hippopotamus'),(1739526343,'Honey
+      Bee'),(1739526344,'Horn Shark'),(1739526345,'Horned Frog'),(1739526346,'Horse'),(1739526347,'Horseshoe
+      Crab'),(1739526348,'Howler Monkey'),(1739526349,'Human'),(1739526350,'Humboldt
+      Penguin'),(1739526351,'Hummingbird'),(1739526352,'Humpback Whale'),(1739526353,'Hyena'),(1739526354,'Ibis'),(1739526355,'Ibizan
+      Hound'),(1739526356,'Iguana'),(1739526357,'Impala'),(1739526358,'Indian Elephant'),(1739526359,'Indian
+      Palm Squirrel'),(1739526360,'Indian Rhinoceros'),(1739526361,'Indian Star Tortoise'),(1739526362,'Indochinese
+      Tiger'),(1739526363,'Indri'),(1739526364,'Insect'),(1739526365,'Irish Setter'),(1739526366,'Irish
+      WolfHound'),(1739526367,'Jack Russel'),(1739526368,'Jackal'),(1739526369,'Jaguar'),(1739526370,'Japanese
+      Chin'),(1739526371,'Japanese Macaque'),(1739526372,'Javan Rhinoceros'),(1739526373,'Javanese'),(1739526374,'Jellyfish'),(1739526375,'Kakapo'),(1739526376,'Kangaroo'),(1739526377,'Keel
+      Billed Toucan'),(1739526378,'Killer Whale'),(1739526379,'King Crab'),(1739526380,'King
+      Penguin'),(1739526381,'Kingfisher'),(1739526382,'Kiwi'),(1739526383,'Koala'),(1739526384,'Komodo
+      Dragon'),(1739526385,'Kudu'),(1739526386,'Labradoodle'),(1739526387,'Labrador
+      Retriever'),(1739526388,'Ladybird'),(1739526389,'Leaf-Tailed Gecko'),(1739526390,'Lemming'),(1739526391,'Lemur'),(1739526392,'Leopard'),(1739526393,'Leopard
+      Cat'),(1739526394,'Leopard Seal'),(1739526395,'Leopard Tortoise'),(1739526396,'Liger'),(1739526397,'Lion'),(1739526398,'Lionfish'),(1739526399,'Little
+      Penguin'),(1739526400,'Lizard'),(1739526401,'Llama'),(1739526402,'Lobster'),(1739526403,'Long-Eared
+      Owl'),(1739526404,'Lynx'),(1739526405,'Macaroni Penguin'),(1739526406,'Macaw'),(1739526407,'Magellanic
+      Penguin'),(1739526408,'Magpie'),(1739526409,'Maine Coon'),(1739526410,'Malayan
+      Civet'),(1739526411,'Malayan Tiger'),(1739526412,'Maltese'),(1739526413,'Manatee'),(1739526414,'Mandrill'),(1739526415,'Manta
+      Ray'),(1739526416,'Marine Toad'),(1739526417,'Markhor'),(1739526418,'Marsh Frog'),(1739526419,'Masked
+      Palm Civet'),(1739526420,'Mastiff'),(1739526421,'Mayfly'),(1739526422,'Meerkat'),(1739526423,'Millipede'),(1739526424,'Minke
+      Whale'),(1739526425,'Mole'),(1739526426,'Molly'),(1739526427,'Mongoose'),(1739526428,'Mongrel'),(1739526429,'Monitor
+      Lizard'),(1739526430,'Monkey'),(1739526431,'Monte Iberia Eleuth'),(1739526432,'Moorhen'),(1739526433,'Moose'),(1739526434,'Moray
+      Eel'),(1739526435,'Moth'),(1739526436,'Mountain Gorilla'),(1739526437,'Mountain
+      Lion'),(1739526438,'Mouse'),(1739526439,'Mule'),(1739526440,'Neanderthal'),(1739526441,'Neapolitan
+      Mastiff'),(1739526442,'Newfoundland'),(1739526443,'Newt'),(1739526444,'Nightingale'),(1739526445,'Norfolk
+      Terrier'),(1739526446,'Norwegian Forest'),(1739526447,'Numbat'),(1739526448,'Nurse
+      Shark'),(1739526449,'Ocelot'),(1739526450,'Octopus'),(1739526451,'Okapi'),(1739526452,'Old
+      English Sheepdog'),(1739526453,'Olm'),(1739526454,'Opossum'),(1739526455,'Orang-utan'),(1739526456,'Ostrich'),(1739526457,'Otter'),(1739526458,'Oyster'),(1739526459,'Pademelon'),(1739526460,'Panther'),(1739526461,'Parrot'),(1739526462,'Patas
+      Monkey'),(1739526463,'Peacock'),(1739526464,'Pekingese'),(1739526465,'Pelican'),(1739526466,'Penguin'),(1739526467,'Persian'),(1739526468,'Pheasant'),(1739526469,'Pied
+      Tamarin'),(1739526470,'Pig'),(1739526471,'Pika'),(1739526472,'Pike'),(1739526473,'Pink
+      Fairy Armadillo'),(1739526474,'Piranha'),(1739526475,'Platypus'),(1739526476,'Pointer'),(1739526477,'Poison
+      Dart Frog'),(1739526478,'Polar Bear'),(1739526479,'Pond Skater'),(1739526480,'Poodle'),(1739526481,'Pool
+      Frog'),(1739526482,'Porcupine'),(1739526483,'Possum'),(1739526484,'Prawn'),(1739526485,'Proboscis
+      Monkey'),(1739526486,'Puffer Fish'),(1739526487,'Puffin'),(1739526488,'Pug'),(1739526489,'Puma'),(1739526490,'Purple
+      Emperor'),(1739526491,'Puss Moth'),(1739526492,'Pygmy Hippopotamus'),(1739526493,'Pygmy
+      Marmoset'),(1739526494,'Quail'),(1739526495,'Quetzal'),(1739526496,'Quokka'),(1739526497,'Quoll'),(1739526498,'Rabbit'),(1739526499,'Raccoon'),(1739526500,'Raccoon
+      Dog'),(1739526501,'Radiated Tortoise '),(1739526502,'Ragdoll'),(1739526503,'Rat'),(1739526504,'Rattlesnake'),(1739526505,'Red
+      Knee Tarantula'),(1739526506,'Red Panda'),(1739526507,'Red Wolf'),(1739526508,'Red-handed
+      Tamarin'),(1739526509,'Reindeer'),(1739526510,'Rhinoceros'),(1739526511,'River
+      Dolphin'),(1739526512,'River Turtle'),(1739526513,'Robin'),(1739526514,'Rock Hyrax'),(1739526515,'Rockhopper
+      Penguin'),(1739526516,'Roseate Spoonbill'),(1739526517,'Rottweiler'),(1739526518,'Royal
+      Penguin'),(1739526519,'Russian Blue'),(1739526520,'Sabre-Toothed Tiger'),(1739526521,'Saint
+      Bernard'),(1739526522,'Salamander'),(1739526523,'Sand Lizard'),(1739526524,'Saola'),(1739526525,'Scorpion'),(1739526526,'Scorpion
+      Fish'),(1739526527,'Sea Dragon'),(1739526528,'Sea Lion'),(1739526529,'Sea Otter'),(1739526530,'Sea
+      Slug'),(1739526531,'Sea Squirt'),(1739526532,'Sea Turtle'),(1739526533,'Sea Urchin'),(1739526534,'Seahorse'),(1739526535,'Seal'),(1739526536,'Serval'),(1739526537,'Sheep'),(1739526538,'Shih
+      Tzu'),(1739526539,'Shrimp'),(1739526540,'Siamese'),(1739526541,'Siamese Fighting
+      Fish'),(1739526542,'Siberian'),(1739526543,'Siberian Husky'),(1739526544,'Siberian
+      Tiger'),(1739526545,'Silver Dollar'),(1739526546,'Skunk'),(1739526547,'Sloth'),(1739526548,'Slow
+      Worm'),(1739526549,'Snail'),(1739526550,'Snake'),(1739526551,'Snapping Turtle'),(1739526552,'Snowshoe'),(1739526553,'Snowy
+      Owl'),(1739526554,'Somali'),(1739526555,'South China Tiger'),(1739526556,'Spadefoot
+      Toad'),(1739526557,'Sparrow'),(1739526558,'Spectacled Bear'),(1739526559,'Sperm
+      Whale'),(1739526560,'Spider Monkey'),(1739526561,'Spiny Dogfish'),(1739526562,'Sponge'),(1739526563,'Squid'),(1739526564,'Squirrel'),(1739526565,'Squirrel
+      Monkey'),(1739526566,'Sri Lankan Elephant'),(1739526567,'Staffordshire Bull Terrier'),(1739526568,'Stag
+      Beetle'),(1739526569,'Starfish'),(1739526570,'Stellers Sea Cow'),(1739526571,'Stick
+      Insect'),(1739526572,'Stingray'),(1739526573,'Stoat'),(1739526574,'Striped Rocket
+      Frog'),(1739526575,'Sumatran Elephant'),(1739526576,'Sumatran Orang-utan'),(1739526577,'Sumatran
+      Rhinoceros'),(1739526578,'Sumatran Tiger'),(1739526579,'Sun Bear'),(1739526580,'Swan'),(1739526581,'Tang'),(1739526582,'Tapir'),(1739526583,'Tarsier'),(1739526584,'Tasmanian
+      Devil'),(1739526585,'Tawny Owl'),(1739526586,'Termite'),(1739526587,'Tetra'),(1739526588,'Thorny
+      Devil'),(1739526589,'Tibetan Mastiff'),(1739526590,'Tiffany'),(1739526591,'Tiger'),(1739526592,'Tiger
+      Salamander'),(1739526593,'Tiger Shark'),(1739526594,'Tortoise'),(1739526595,'Toucan'),(1739526596,'Tree
+      Frog'),(1739526597,'Tropicbird'),(1739526598,'Tuatara'),(1739526599,'Turkey'),(1739526600,'Turkish
+      Angora'),(1739526601,'Uakari'),(1739526602,'Uguisu'),(1739526603,'Umbrellabird'),(1739526604,'Vampire
+      Bat'),(1739526605,'Vervet Monkey'),(1739526606,'Vulture'),(1739526607,'Wallaby'),(1739526608,'Walrus'),(1739526609,'Warthog'),(1739526610,'Wasp'),(1739526611,'Water
+      Buffalo'),(1739526612,'Water Dragon'),(1739526613,'Water Vole'),(1739526614,'Weasel'),(1739526615,'Welsh
+      Corgi'),(1739526616,'West Highland Terrier'),(1739526617,'Western Gorilla'),(1739526618,'Western
+      Lowland Gorilla'),(1739526619,'Whale Shark'),(1739526620,'Whippet'),(1739526621,'White
+      Faced Capuchin'),(1739526622,'White Rhinoceros'),(1739526623,'White Tiger'),(1739526624,'Wild
+      Boar'),(1739526625,'Wildebeest'),(1739526626,'Wolf'),(1739526627,'Wolverine'),(1739526628,'Wombat'),(1739526629,'Woodlouse'),(1739526630,'Woodpecker'),(1739526631,'Woolly
+      Mammoth'),(1739526632,'Woolly Monkey'),(1739526633,'Wrasse'),(1739526634,'X-Ray
+      Tetra'),(1739526635,'Yak'),(1739526636,'Yellow-Eyed Penguin'),(1739526637,'Yorkshire
+      Terrier'),(1739526638,'Zebra'),(1739526639,'Zebra Shark'),(1739526640,'Zebu'),(1739526641,'Zonkey'),(1739526642,'Zorse');\n/*!40000
+      ALTER TABLE `common_names` ENABLE KEYS */;\nUNLOCK TABLES;\n\n--\n-- Table structure
+      for table `locations`\n--\n\nDROP TABLE IF EXISTS `locations`;\n/*!40101 SET @saved_cs_client
+      \    = @@character_set_client */;\n/*!40101 SET character_set_client = utf8 */;\nCREATE
+      TABLE `locations` (\n  `region` tinytext,\n  `name` tinytext\n) ENGINE=InnoDB
+      DEFAULT CHARSET=latin1;\n/*!40101 SET character_set_client = @saved_cs_client
+      */;\n\n--\n-- Dumping data for table `locations`\n--\n\nLOCK TABLES `locations`
+      WRITE;\n/*!40000 ALTER TABLE `locations` DISABLE KEYS */;\nINSERT INTO `locations`
+      VALUES ('Africa','Abyssinian'),('Africa','African Bush Elephant'),('Africa','African
+      Civet'),('Africa','African Clawed Frog'),('Africa','African Forest Elephant'),('Africa','African
+      Palm Civet'),('Africa','African Penguin'),('Africa','African Tree Toad'),('Africa','African
+      Wild Dog'),('Africa','Ant'),('Africa','Anteater'),('Africa','Antelope'),('Africa','Aye
+      Aye '),('Africa','Baboon'),('Africa','Bactrian Camel'),('Africa','Barb'),('Africa','Barn
+      Owl'),('Africa','Basenji Dog'),('Africa','Bat'),('Africa','Beetle'),('Africa','Bird'),('Africa','Black
+      Rhinoceros'),('Africa','Bongo'),('Africa','Bonobo'),('Africa','Buffalo'),('Africa','Bumble
+      Bee'),('Africa','Butterfly'),('Africa','Camel'),('Africa','Caracal'),('Africa','Cat'),('Africa','Caterpillar'),('Africa','Catfish'),('Africa','Chameleon'),('Africa','Cheetah'),('Africa','Chimpanzee'),('Africa','Cichlid'),('Africa','Cockroach'),('Africa','Common
+      Buzzard'),('Africa','Cow'),('Africa','Crab'),('Africa','Crane'),('Africa','Crocodile'),('Africa','Cross
+      River Gorilla'),('Africa','Dog'),('Africa','Donkey'),('Africa','Dormouse'),('Africa','Dragonfly'),('Africa','Duck'),('Africa','Dwarf
+      Crocodile'),('Africa','Earwig '),('Africa','Eastern Gorilla'),('Africa','Eastern
+      Lowland Gorilla'),('Africa','Egyptian Mau'),('Africa','Elephant Shrew'),('Africa','Fennec
+      Fox'),('Africa','Flamingo'),('Africa','Fly'),('Africa','Fossa'),('Africa','Frog'),('Africa','Gecko'),('Africa','Gerbil'),('Africa','Giant
+      African Land Snail'),('Africa','Giraffe'),('Africa','Glass Lizard'),('Africa','Glow
+      Worm'),('Africa','Golden Oriole'),('Africa','Gorilla'),('Africa','Grasshopper'),('Africa','Green
+      Bee-Eater'),('Africa','Grey Mouse Lemur'),('Africa','Guinea Fowl'),('Africa','Hamster'),('Africa','Hedgehog'),('Africa','Heron'),('Africa','Hippopotamus'),('Africa','Honey
+      Bee'),('Africa','Horse'),('Africa','Human'),('Africa','Hummingbird'),('Africa','Hyena'),('Africa','Ibis'),('Africa','Impala'),('Africa','Indri'),('Africa','Insect'),('Africa','Jackal'),('Africa','Kingfisher'),('Africa','Kudu'),('Africa','Ladybird'),('Africa','Leaf-Tailed
+      Gecko'),('Africa','Lemur'),('Africa','Leopard'),('Africa','Leopard Tortoise'),('Africa','Liger'),('Africa','Lion'),('Africa','Lizard'),('Africa','Magpie'),('Africa','Mandrill'),('Africa','Mayfly'),('Africa','Meerkat'),('Africa','Millipede'),('Africa','Mole'),('Africa','Mongoose'),('Africa','Mongrel'),('Africa','Monitor
+      Lizard'),('Africa','Monkey'),('Africa','Moorhen'),('Africa','Moth'),('Africa','Mountain
+      Gorilla'),('Africa','Mouse'),('Africa','Mule'),('Africa','Nightingale'),('Africa','Okapi'),('Africa','Ostrich'),('Africa','Otter'),('Africa','Panther'),('Africa','Parrot'),('Africa','Patas
+      Monkey'),('Africa','Peacock'),('Africa','Pheasant'),('Africa','Pika'),('Africa','Puss
+      Moth'),('Africa','Pygmy Hippopotamus'),('Africa','Quail'),('Africa','Rabbit'),('Africa','Radiated
+      Tortoise '),('Africa','Rat'),('Africa','Rattlesnake'),('Africa','Rhinoceros'),('Africa','River
+      Turtle'),('Africa','Robin'),('Africa','Rock Hyrax'),('Africa','Scorpion'),('Africa','Seahorse'),('Africa','Serval'),('Africa','Shrimp'),('Africa','Snail'),('Africa','Snake'),('Africa','Sparrow'),('Africa','Squirrel'),('Africa','Stick
+      Insect'),('Africa','Swan'),('Africa','Termite'),('Africa','Tortoise'),('Africa','Tree
+      Frog'),('Africa','Vervet Monkey'),('Africa','Vulture'),('Africa','Warthog'),('Africa','Wasp'),('Africa','Water
+      Buffalo'),('Africa','Western Gorilla'),('Africa','Western Lowland Gorilla'),('Africa','White
+      Rhinoceros'),('Africa','Wildebeest'),('Africa','Wolf'),('Africa','Wolverine'),('Africa','Woodlouse'),('Africa','Woodpecker'),('Africa','Yak'),('Africa','Zebra'),('Africa','Zebu'),('Africa','Zonkey'),('Africa','Zorse'),('Antarctica','Adelie
+      Penguin'),('Antarctica','Centipede'),('Antarctica','Chinstrap Penguin'),('Antarctica','Emperor
+      Penguin'),('Antarctica','Fly'),('Antarctica','Gentoo Penguin'),('Antarctica','Insect'),('Antarctica','King
+      Penguin'),('Antarctica','Leopard Seal'),('Antarctica','Macaroni Penguin'),('Antarctica','Mouse'),('Antarctica','Penguin'),('Antarctica','Pika'),('Antarctica','Rat'),('Antarctica','Rockhopper
+      Penguin'),('Antarctica','Royal Penguin'),('Antarctica','Snail'),('Arctic Ocean','Arctic
+      Fox'),('Arctic Ocean','Arctic Hare'),('Arctic Ocean','Arctic Wolf'),('Arctic Ocean','Barnacle'),('Arctic
+      Ocean','Bear'),('Arctic Ocean','Bird'),('Arctic Ocean','Blue Whale'),('Arctic
+      Ocean','Centipede'),('Arctic Ocean','Crab'),('Arctic Ocean','Cuttlefish'),('Arctic
+      Ocean','Fish'),('Arctic Ocean','Flounder'),('Arctic Ocean','Fly'),('Arctic Ocean','Grouse'),('Arctic
+      Ocean','Humpback Whale'),('Arctic Ocean','Insect'),('Arctic Ocean','Jellyfish'),('Arctic
+      Ocean','Killer Whale'),('Arctic Ocean','King Crab'),('Arctic Ocean','Lobster'),('Arctic
+      Ocean','Pika'),('Arctic Ocean','Polar Bear'),('Arctic Ocean','Puffin'),('Arctic
+      Ocean','Reindeer'),('Arctic Ocean','Seal'),('Arctic Ocean','Shrimp'),('Arctic
+      Ocean','Snail'),('Arctic Ocean','Snowy Owl'),('Arctic Ocean','Sponge'),('Arctic
+      Ocean','Squid'),('Arctic Ocean','Stellers Sea Cow'),('Arctic Ocean','Stingray'),('Arctic
+      Ocean','Walrus'),('Arctic Ocean','Woolly Mammoth'),('Atlantic Ocean','Angelfish'),('Atlantic
+      Ocean','Barnacle'),('Atlantic Ocean','Barracuda'),('Atlantic Ocean','Basking Shark'),('Atlantic
+      Ocean','Bird'),('Atlantic Ocean','Blue Whale'),('Atlantic Ocean','Boston Terrier'),('Atlantic
+      Ocean','Bottle Nosed Dolphin'),('Atlantic Ocean','Bull Shark'),('Atlantic Ocean','Butterfly
+      Fish'),('Atlantic Ocean','Clown Fish'),('Atlantic Ocean','Coral'),('Atlantic Ocean','Crab'),('Atlantic
+      Ocean','Cuttlefish'),('Atlantic Ocean','Dolphin'),('Atlantic Ocean','Dusky Dolphin'),('Atlantic
+      Ocean','Elephant Seal'),('Atlantic Ocean','Fin Whale'),('Atlantic Ocean','Fish'),('Atlantic
+      Ocean','Flounder'),('Atlantic Ocean','Fly'),('Atlantic Ocean','Fur Seal'),('Atlantic
+      Ocean','Great White Shark'),('Atlantic Ocean','Grey Seal'),('Atlantic Ocean','Hammerhead
+      Shark'),('Atlantic Ocean','Hermit Crab'),('Atlantic Ocean','Horseshoe Crab'),('Atlantic
+      Ocean','Humpback Whale'),('Atlantic Ocean','Insect'),('Atlantic Ocean','Jellyfish'),('Atlantic
+      Ocean','Killer Whale'),('Atlantic Ocean','King Crab'),('Atlantic Ocean','Lobster'),('Atlantic
+      Ocean','Manatee'),('Atlantic Ocean','Manta Ray'),('Atlantic Ocean','Minke Whale'),('Atlantic
+      Ocean','Moray Eel'),('Atlantic Ocean','Nurse Shark'),('Atlantic Ocean','Octopus'),('Atlantic
+      Ocean','Oyster'),('Atlantic Ocean','Panther'),('Atlantic Ocean','Pelican'),('Atlantic
+      Ocean','Penguin'),('Atlantic Ocean','Pika'),('Atlantic Ocean','Prawn'),('Atlantic
+      Ocean','Puffer Fish'),('Atlantic Ocean','Rockhopper Penguin'),('Atlantic Ocean','Sea
+      Lion'),('Atlantic Ocean','Sea Slug'),('Atlantic Ocean','Sea Squirt'),('Atlantic
+      Ocean','Sea Turtle'),('Atlantic Ocean','Sea Urchin'),('Atlantic Ocean','Seahorse'),('Atlantic
+      Ocean','Seal'),('Atlantic Ocean','Shrimp'),('Atlantic Ocean','Snail'),('Atlantic
+      Ocean','Sperm Whale'),('Atlantic Ocean','Spiny Dogfish'),('Atlantic Ocean','Sponge'),('Atlantic
+      Ocean','Squid'),('Atlantic Ocean','Starfish'),('Atlantic Ocean','Stingray'),('Atlantic
+      Ocean','Tiger Shark'),('Atlantic Ocean','Tropicbird'),('Atlantic Ocean','Whale
+      Shark'),('Atlantic Ocean','Wrasse'),('Australia','Ant'),('Australia','Anteater'),('Australia','Australian
+      Cattle Dog'),('Australia','Australian Kelpie Dog'),('Australia','Australian Mist'),('Australia','Australian
+      Shepherd'),('Australia','Australian Terrier'),('Australia','Avocet'),('Australia','Bandicoot'),('Australia','Barn
+      Owl'),('Australia','Bat'),('Australia','Bearded Dragon'),('Australia','Beetle'),('Australia','Bird'),('Australia','Birds
+      Of Paradise'),('Australia','Budgerigar'),('Australia','Burrowing Frog'),('Australia','Butterfly'),('Australia','Camel'),('Australia','Cassowary'),('Australia','Cat'),('Australia','Caterpillar'),('Australia','Catfish'),('Australia','Centipede'),('Australia','Chamois'),('Australia','Chicken'),('Australia','Cockroach'),('Australia','Cow'),('Australia','Crab'),('Australia','Crane'),('Australia','Crested
+      Penguin'),('Australia','Crocodile'),('Australia','Cuscus'),('Australia','Dingo'),('Australia','Dog'),('Australia','Donkey'),('Australia','Dragonfly'),('Australia','Duck'),('Australia','Earwig
+      '),('Australia','Echidna'),('Australia','Emu'),('Australia','Fly'),('Australia','Frilled
+      Lizard'),('Australia','Frog'),('Australia','Gecko'),('Australia','Glow Worm'),('Australia','Grasshopper'),('Australia','Hamster'),('Australia','Heron'),('Australia','Highland
+      Cattle'),('Australia','Honey Bee'),('Australia','Horse'),('Australia','Human'),('Australia','Hummingbird'),('Australia','Ibis'),('Australia','Indian
+      Palm Squirrel'),('Australia','Insect'),('Australia','Kakapo'),('Australia','Kangaroo'),('Australia','Kiwi'),('Australia','Koala'),('Australia','Labradoodle'),('Australia','Ladybird'),('Australia','Little
+      Penguin'),('Australia','Lizard'),('Australia','Magpie'),('Australia','Mayfly'),('Australia','Millipede'),('Australia','Mongrel'),('Australia','Monitor
+      Lizard'),('Australia','Monkey'),('Australia','Moorhen'),('Australia','Moth'),('Australia','Mouse'),('Australia','Numbat'),('Australia','Otter'),('Australia','Pademelon'),('Australia','Panther'),('Australia','Parrot'),('Australia','Peacock'),('Australia','Pheasant'),('Australia','Pika'),('Australia','Platypus'),('Australia','Possum'),('Australia','Quail'),('Australia','Quokka'),('Australia','Quoll'),('Australia','Rat'),('Australia','Rattlesnake'),('Australia','River
+      Turtle'),('Australia','Robin'),('Australia','Scorpion'),('Australia','Sea Dragon'),('Australia','Seahorse'),('Australia','Sheep'),('Australia','Shrimp'),('Australia','Snail'),('Australia','Snake'),('Australia','Sparrow'),('Australia','Stick
+      Insect'),('Australia','Striped Rocket Frog'),('Australia','Swan'),('Australia','Tasmanian
+      Devil'),('Australia','Termite'),('Australia','Thorny Devil'),('Australia','Tortoise'),('Australia','Tuatara'),('Australia','Wallaby'),('Australia','Wasp'),('Australia','Water
+      Buffalo'),('Australia','Water Dragon'),('Australia','Wombat'),('Australia','Woodlouse'),('Australia','Yellow-Eyed
+      Penguin'),('Canada','Alaskan Malamute'),('Canada','American Bulldog'),('Canada','American
+      Cocker Spaniel'),('Canada','American Coonhound'),('Canada','American Eskimo Dog'),('Canada','American
+      Foxhound'),('Canada','American Pit Bull Terrier'),('Canada','American Staffordshire
+      Terrier'),('Canada','American Water Spaniel'),('Canada','Anatolian Shepherd Dog'),('Canada','Ant'),('Canada','Australian
+      Shepherd'),('Canada','Balinese'),('Canada','Bat'),('Canada','Bear'),('Canada','Beaver'),('Canada','Beetle'),('Canada','Bird'),('Canada','Bison'),('Canada','Black
+      Bear'),('Canada','Black Widow Spider'),('Canada','Blue Lacy Dog'),('Canada','Bluetick
+      Coonhound'),('Canada','Bobcat'),('Canada','Bombay'),('Canada','Boston Terrier'),('Canada','Boykin
+      Spaniel'),('Canada','Brown Bear'),('Canada','Bumble Bee'),('Canada','Butterfly'),('Canada','Carolina
+      Dog'),('Canada','Cat'),('Canada','Caterpillar'),('Canada','Catfish'),('Canada','Chesapeake
+      Bay Retriever'),('Canada','Chicken'),('Canada','Chinook'),('Canada','Chipmunk'),('Canada','Cockroach'),('Canada','Common
+      Loon'),('Canada','Cougar'),('Canada','Cow'),('Canada','Coyote'),('Canada','Crane'),('Canada','Deer'),('Canada','Dog'),('Canada','Dragonfly'),('Canada','Duck'),('Canada','Eagle'),('Canada','Earwig
+      '),('Canada','English Shepherd'),('Canada','Eskimo Dog'),('Canada','Fly'),('Canada','Fox'),('Canada','Glass
+      Lizard'),('Canada','Glow Worm'),('Canada','Goose'),('Canada','Gopher'),('Canada','Grasshopper'),('Canada','Grizzly
+      Bear'),('Canada','Hamster'),('Canada','Hare'),('Canada','Heron'),('Canada','Highland
+      Cattle'),('Canada','Himalayan'),('Canada','Honey Bee'),('Canada','Horse'),('Canada','Human'),('Canada','Insect'),('Canada','Javanese'),('Canada','Kingfisher'),('Canada','Ladybird'),('Canada','Lemming'),('Canada','Lizard'),('Canada','Long-Eared
+      Owl'),('Canada','Lynx'),('Canada','Maine Coon'),('Canada','Millipede'),('Canada','Mole'),('Canada','Mongrel'),('Canada','Moose'),('Canada','Moth'),('Canada','Mountain
+      Lion'),('Canada','Mouse'),('Canada','Mule'),('Canada','Newfoundland'),('Canada','Opossum'),('Canada','Otter'),('Canada','Panther'),('Canada','Pheasant'),('Canada','Pika'),('Canada','Pike'),('Canada','Polar
+      Bear'),('Canada','Puffin'),('Canada','Puma'),('Canada','Quail'),('Canada','Raccoon'),('Canada','Ragdoll'),('Canada','Rat'),('Canada','Reindeer'),('Canada','River
+      Turtle'),('Canada','Salamander'),('Canada','Shrimp'),('Canada','Siberian Husky'),('Canada','Skunk'),('Canada','Snail'),('Canada','Snake'),('Canada','Snapping
+      Turtle'),('Canada','Snowshoe'),('Canada','Snowy Owl'),('Canada','Somali'),('Canada','Spadefoot
+      Toad'),('Canada','Sparrow'),('Canada','Squirrel'),('Canada','Stick Insect'),('Canada','Stoat'),('Canada','Swan'),('Canada','Tiffany'),('Canada','Vulture'),('Canada','Wasp'),('Canada','Weasel'),('Canada','Wolf'),('Canada','Woodlouse'),('Canada','Woodpecker'),('Eurasia-Asia','Afghan
+      Hound'),('Eurasia-Asia','Ainu Dog'),('Eurasia-Asia','Akita'),('Eurasia-Asia','Alligator'),('Eurasia-Asia','Ant'),('Eurasia-Asia','Anteater'),('Eurasia-Asia','Antelope'),('Eurasia-Asia','Asian
+      Elephant'),('Eurasia-Asia','Asian Giant Hornet'),('Eurasia-Asia','Asian Palm Civet'),('Eurasia-Asia','Asiatic
+      Black Bear'),('Eurasia-Asia','Australian Shepherd'),('Eurasia-Asia','Bactrian
+      Camel'),('Eurasia-Asia','Banded Palm Civet'),('Eurasia-Asia','Barb'),('Eurasia-Asia','Barn
+      Owl'),('Eurasia-Asia','Bat'),('Eurasia-Asia','Bear'),('Eurasia-Asia','Beetle'),('Eurasia-Asia','Bengal
+      Tiger'),('Eurasia-Asia','Binturong'),('Eurasia-Asia','Bird'),('Eurasia-Asia','Birds
+      Of Paradise'),('Eurasia-Asia','Birman'),('Eurasia-Asia','Black Russian Terrier'),('Eurasia-Asia','Bornean
+      Orang-utan'),('Eurasia-Asia','Borneo Elephant'),('Eurasia-Asia','Brown Bear'),('Eurasia-Asia','Bumble
+      Bee'),('Eurasia-Asia','Burmese'),('Eurasia-Asia','Butterfly'),('Eurasia-Asia','Camel'),('Eurasia-Asia','Canaan
+      Dog'),('Eurasia-Asia','Caracal'),('Eurasia-Asia','Cat'),('Eurasia-Asia','Caterpillar'),('Eurasia-Asia','Catfish'),('Eurasia-Asia','Centipede'),('Eurasia-Asia','Chameleon'),('Eurasia-Asia','Chicken'),('Eurasia-Asia','Chinese
+      Crested Dog'),('Eurasia-Asia','Chow Chow'),('Eurasia-Asia','Clouded Leopard'),('Eurasia-Asia','Cockroach'),('Eurasia-Asia','Common
+      Buzzard'),('Eurasia-Asia','Cow'),('Eurasia-Asia','Crab'),('Eurasia-Asia','Crab-Eating
+      Macaque'),('Eurasia-Asia','Crane'),('Eurasia-Asia','Crocodile'),('Eurasia-Asia','Dalmatian'),('Eurasia-Asia','Deer'),('Eurasia-Asia','Dhole'),('Eurasia-Asia','Dog'),('Eurasia-Asia','Donkey'),('Eurasia-Asia','Dormouse'),('Eurasia-Asia','Dragonfly'),('Eurasia-Asia','Duck'),('Eurasia-Asia','Eagle'),('Eurasia-Asia','Earwig
+      '),('Eurasia-Asia','Elephant'),('Eurasia-Asia','Falcon'),('Eurasia-Asia','Fire-Bellied
+      Toad'),('Eurasia-Asia','Fishing Cat'),('Eurasia-Asia','Fly'),('Eurasia-Asia','Flying
+      Squirrel'),('Eurasia-Asia','Fox'),('Eurasia-Asia','Frilled Lizard'),('Eurasia-Asia','Frog'),('Eurasia-Asia','Gecko'),('Eurasia-Asia','Gerbil'),('Eurasia-Asia','Gharial'),('Eurasia-Asia','Giant
+      African Land Snail'),('Eurasia-Asia','Giant Panda Bear'),('Eurasia-Asia','Gibbon'),('Eurasia-Asia','Glass
+      Lizard'),('Eurasia-Asia','Glow Worm'),('Eurasia-Asia','Goat'),('Eurasia-Asia','Golden
+      Oriole'),('Eurasia-Asia','Goose'),('Eurasia-Asia','Grasshopper'),('Eurasia-Asia','Green
+      Bee-Eater'),('Eurasia-Asia','Hamster'),('Eurasia-Asia','Hedgehog'),('Eurasia-Asia','Heron'),('Eurasia-Asia','Honey
+      Bee'),('Eurasia-Asia','Horse'),('Eurasia-Asia','Human'),('Eurasia-Asia','Hummingbird'),('Eurasia-Asia','Hyena'),('Eurasia-Asia','Ibis'),('Eurasia-Asia','Indian
+      Elephant'),('Eurasia-Asia','Indian Palm Squirrel'),('Eurasia-Asia','Indian Rhinoceros'),('Eurasia-Asia','Indian
+      Star Tortoise'),('Eurasia-Asia','Indochinese Tiger'),('Eurasia-Asia','Insect'),('Eurasia-Asia','Jackal'),('Eurasia-Asia','Japanese
+      Chin'),('Eurasia-Asia','Japanese Macaque'),('Eurasia-Asia','Javan Rhinoceros'),('Eurasia-Asia','Kingfisher'),('Eurasia-Asia','Komodo
+      Dragon'),('Eurasia-Asia','Ladybird'),('Eurasia-Asia','Leopard'),('Eurasia-Asia','Leopard
+      Cat'),('Eurasia-Asia','Liger'),('Eurasia-Asia','Lizard'),('Eurasia-Asia','Llama'),('Eurasia-Asia','Long-Eared
+      Owl'),('Eurasia-Asia','Lynx'),('Eurasia-Asia','Magpie'),('Eurasia-Asia','Malayan
+      Civet'),('Eurasia-Asia','Malayan Tiger'),('Eurasia-Asia','Markhor'),('Eurasia-Asia','Masked
+      Palm Civet'),('Eurasia-Asia','Mayfly'),('Eurasia-Asia','Millipede'),('Eurasia-Asia','Mole'),('Eurasia-Asia','Mongoose'),('Eurasia-Asia','Mongrel'),('Eurasia-Asia','Monitor
+      Lizard'),('Eurasia-Asia','Monkey'),('Eurasia-Asia','Moorhen'),('Eurasia-Asia','Moth'),('Eurasia-Asia','Mouse'),('Eurasia-Asia','Mule'),('Eurasia-Asia','Neanderthal'),('Eurasia-Asia','Newt'),('Eurasia-Asia','Nightingale'),('Eurasia-Asia','Orang-utan'),('Eurasia-Asia','Otter'),('Eurasia-Asia','Panther'),('Eurasia-Asia','Parrot'),('Eurasia-Asia','Peacock'),('Eurasia-Asia','Pekingese'),('Eurasia-Asia','Persian'),('Eurasia-Asia','Pheasant'),('Eurasia-Asia','Pig'),('Eurasia-Asia','Pika'),('Eurasia-Asia','Pond
+      Skater'),('Eurasia-Asia','Porcupine'),('Eurasia-Asia','Proboscis Monkey'),('Eurasia-Asia','Puffin'),('Eurasia-Asia','Pug'),('Eurasia-Asia','Quail'),('Eurasia-Asia','Rabbit'),('Eurasia-Asia','Raccoon
+      Dog'),('Eurasia-Asia','Rat'),('Eurasia-Asia','Rattlesnake'),('Eurasia-Asia','Red
+      Panda'),('Eurasia-Asia','Reindeer'),('Eurasia-Asia','Rhinoceros'),('Eurasia-Asia','River
+      Dolphin'),('Eurasia-Asia','River Turtle'),('Eurasia-Asia','Robin'),('Eurasia-Asia','Russian
+      Blue'),('Eurasia-Asia','Salamander'),('Eurasia-Asia','Saola'),('Eurasia-Asia','Scorpion'),('Eurasia-Asia','Seahorse'),('Eurasia-Asia','Sheep'),('Eurasia-Asia','Shih
+      Tzu'),('Eurasia-Asia','Shrimp'),('Eurasia-Asia','Siamese'),('Eurasia-Asia','Siamese
+      Fighting Fish'),('Eurasia-Asia','Siberian'),('Eurasia-Asia','Siberian Tiger'),('Eurasia-Asia','Skunk'),('Eurasia-Asia','Slow
+      Worm'),('Eurasia-Asia','Snail'),('Eurasia-Asia','Snake'),('Eurasia-Asia','Snowy
+      Owl'),('Eurasia-Asia','South China Tiger'),('Eurasia-Asia','Sparrow'),('Eurasia-Asia','Squirrel'),('Eurasia-Asia','Sri
+      Lankan Elephant'),('Eurasia-Asia','Stick Insect'),('Eurasia-Asia','Stoat'),('Eurasia-Asia','Sumatran
+      Elephant'),('Eurasia-Asia','Sumatran Orang-utan'),('Eurasia-Asia','Sumatran Rhinoceros'),('Eurasia-Asia','Sumatran
+      Tiger'),('Eurasia-Asia','Sun Bear'),('Eurasia-Asia','Swan'),('Eurasia-Asia','Tapir'),('Eurasia-Asia','Tarsier'),('Eurasia-Asia','Tawny
+      Owl'),('Eurasia-Asia','Termite'),('Eurasia-Asia','Tibetan Mastiff'),('Eurasia-Asia','Tiger'),('Eurasia-Asia','Tortoise'),('Eurasia-Asia','Tree
+      Frog'),('Eurasia-Asia','Uguisu'),('Eurasia-Asia','Vulture'),('Eurasia-Asia','Wasp'),('Eurasia-Asia','Water
+      Buffalo'),('Eurasia-Asia','Water Dragon'),('Eurasia-Asia','Weasel'),('Eurasia-Asia','White
+      Tiger'),('Eurasia-Asia','Wild Boar'),('Eurasia-Asia','Wolf'),('Eurasia-Asia','Woodlouse'),('Eurasia-Asia','Woodpecker'),('Eurasia-Asia','Yak'),('Eurasia-Asia','Zebu'),('Europe','Affenpinscher'),('Europe','Airedale
+      Terrier '),('Europe','Akbash'),('Europe','Alpine Dachsbracke'),('Europe','Ant'),('Europe','Appenzeller
+      Dog'),('Europe','Avocet'),('Europe','Badger'),('Europe','Barn Owl'),('Europe','Basset
+      Hound'),('Europe','Bat'),('Europe','Bavarian Mountain Hound'),('Europe','Beagle'),('Europe','Bearded
+      Collie'),('Europe','Beaver'),('Europe','Bedlington Terrier'),('Europe','Beetle'),('Europe','Bernese
+      Mountain Dog'),('Europe','Bichon Frise'),('Europe','Bird'),('Europe','Black Russian
+      Terrier'),('Europe','Bloodhound'),('Europe','Bolognese Dog'),('Europe','Border
+      Collie'),('Europe','Border Terrier'),('Europe','Boxer Dog'),('Europe','Brown Bear'),('Europe','Bull
+      Mastiff'),('Europe','Bull Terrier'),('Europe','Bulldog'),('Europe','Bumble Bee'),('Europe','Butterfly'),('Europe','Cairn
+      Terrier'),('Europe','Cat'),('Europe','Caterpillar'),('Europe','Catfish'),('Europe','Cavalier
+      King Charles Spaniel'),('Europe','Centipede'),('Europe','Cesky Fousek'),('Europe','Chameleon'),('Europe','Chamois'),('Europe','Chicken'),('Europe','Chipmunk'),('Europe','Clumber
+      Spaniel'),('Europe','Cockroach'),('Europe','Collie'),('Europe','Common Buzzard'),('Europe','Common
+      Frog'),('Europe','Common Loon'),('Europe','Common Toad'),('Europe','Cow'),('Europe','Crane'),('Europe','Curly
+      Coated Retriever'),('Europe','Dachshund'),('Europe','Deer'),('Europe','Deutsche
+      Bracke'),('Europe','Doberman Pinscher'),('Europe','Dog'),('Europe','Dogue De Bordeaux'),('Europe','Donkey'),('Europe','Dormouse'),('Europe','Dragonfly'),('Europe','Drever'),('Europe','Duck'),('Europe','Dunker'),('Europe','Eagle'),('Europe','Earwig
+      '),('Europe','Edible Frog'),('Europe','English Cocker Spaniel'),('Europe','English
+      Springer Spaniel'),('Europe','Entlebucher Mountain Dog'),('Europe','Epagneul Pont
+      Audemer'),('Europe','Estrela Mountain Dog'),('Europe','Falcon'),('Europe','Ferret'),('Europe','Field
+      Spaniel'),('Europe','Finnish Spitz'),('Europe','Fire-Bellied Toad'),('Europe','Flat
+      Coat Retriever'),('Europe','Fly'),('Europe','Flying Squirrel'),('Europe','Fox'),('Europe','Fox
+      Terrier'),('Europe','French Bulldog'),('Europe','Frog'),('Europe','German Pinscher'),('Europe','German
+      Shepherd'),('Europe','Giant Schnauzer'),('Europe','Glass Lizard'),('Europe','Glow
+      Worm'),('Europe','Goat'),('Europe','Golden Oriole'),('Europe','Golden Retriever'),('Europe','Goose'),('Europe','Grasshopper'),('Europe','Great
+      Dane'),('Europe','Greater Swiss Mountain Dog'),('Europe','Greenland Dog'),('Europe','Greyhound'),('Europe','Grouse'),('Europe','Hamster'),('Europe','Hare'),('Europe','Harrier'),('Europe','Hedgehog'),('Europe','Heron'),('Europe','Highland
+      Cattle'),('Europe','Honey Bee'),('Europe','Horse'),('Europe','Human'),('Europe','Ibizan
+      Hound'),('Europe','Insect'),('Europe','Irish Setter'),('Europe','Irish WolfHound'),('Europe','Jack
+      Russel'),('Europe','Jackal'),('Europe','Kingfisher'),('Europe','Labrador Retriever'),('Europe','Ladybird'),('Europe','Lemming'),('Europe','Lizard'),('Europe','Long-Eared
+      Owl'),('Europe','Magpie'),('Europe','Maltese'),('Europe','Marsh Frog'),('Europe','Mastiff'),('Europe','Mayfly'),('Europe','Millipede'),('Europe','Mole'),('Europe','Mongrel'),('Europe','Moorhen'),('Europe','Moose'),('Europe','Moth'),('Europe','Mouse'),('Europe','Mule'),('Europe','Neanderthal'),('Europe','Neapolitan
+      Mastiff'),('Europe','Newt'),('Europe','Nightingale'),('Europe','Norfolk Terrier'),('Europe','Norwegian
+      Forest'),('Europe','Old English Sheepdog'),('Europe','Olm'),('Europe','Otter'),('Europe','Panther'),('Europe','Pheasant'),('Europe','Pig'),('Europe','Pika'),('Europe','Pike'),('Europe','Pointer'),('Europe','Pond
+      Skater'),('Europe','Poodle'),('Europe','Pool Frog'),('Europe','Porcupine'),('Europe','Puffin'),('Europe','Purple
+      Emperor'),('Europe','Puss Moth'),('Europe','Quail'),('Europe','Rabbit'),('Europe','Raccoon'),('Europe','Raccoon
+      Dog'),('Europe','Rat'),('Europe','Reindeer'),('Europe','River Turtle'),('Europe','Robin'),('Europe','Rottweiler'),('Europe','Russian
+      Blue'),('Europe','Saint Bernard'),('Europe','Salamander'),('Europe','Sand Lizard'),('Europe','Scorpion'),('Europe','Seahorse'),('Europe','Sheep'),('Europe','Shrimp'),('Europe','Siberian'),('Europe','Slow
+      Worm'),('Europe','Snail'),('Europe','Snake'),('Europe','Snowy Owl'),('Europe','Spadefoot
+      Toad'),('Europe','Sparrow'),('Europe','Squirrel'),('Europe','Staffordshire Bull
+      Terrier'),('Europe','Stag Beetle'),('Europe','Stick Insect'),('Europe','Stoat'),('Europe','Swan'),('Europe','Tawny
+      Owl'),('Europe','Termite'),('Europe','Tree Frog'),('Europe','Turkish Angora'),('Europe','Vulture'),('Europe','Wasp'),('Europe','Water
+      Buffalo'),('Europe','Water Vole'),('Europe','Weasel'),('Europe','Welsh Corgi'),('Europe','West
+      Highland Terrier'),('Europe','Whippet'),('Europe','Wild Boar'),('Europe','Wolf'),('Europe','Wolverine'),('Europe','Woodlouse'),('Europe','Woodpecker'),('Europe','Yorkshire
+      Terrier'),('Indian Ocean','Albatross'),('Indian Ocean','Aldabra Giant Tortoise'),('Indian
+      Ocean','Angelfish'),('Indian Ocean','Barnacle'),('Indian Ocean','Barracuda'),('Indian
+      Ocean','Bird'),('Indian Ocean','Blue Whale'),('Indian Ocean','Bottle Nosed Dolphin'),('Indian
+      Ocean','Bull Shark'),('Indian Ocean','Butterfly Fish'),('Indian Ocean','Clown
+      Fish'),('Indian Ocean','Coral'),('Indian Ocean','Crab'),('Indian Ocean','Cuttlefish'),('Indian
+      Ocean','Dodo'),('Indian Ocean','Dolphin'),('Indian Ocean','Dugong'),('Indian Ocean','Dusky
+      Dolphin'),('Indian Ocean','Elephant Seal'),('Indian Ocean','Fin Whale'),('Indian
+      Ocean','Fish'),('Indian Ocean','Fly'),('Indian Ocean','Fur Seal'),('Indian Ocean','Giant
+      African Land Snail'),('Indian Ocean','Giant Clam'),('Indian Ocean','Great White
+      Shark'),('Indian Ocean','Grey Reef Shark'),('Indian Ocean','Hammerhead Shark'),('Indian
+      Ocean','Hermit Crab'),('Indian Ocean','Horseshoe Crab'),('Indian Ocean','Humpback
+      Whale'),('Indian Ocean','Insect'),('Indian Ocean','Jellyfish'),('Indian Ocean','Killer
+      Whale'),('Indian Ocean','King Crab'),('Indian Ocean','Lobster'),('Indian Ocean','Manta
+      Ray'),('Indian Ocean','Moray Eel'),('Indian Ocean','Octopus'),('Indian Ocean','Oyster'),('Indian
+      Ocean','Panther'),('Indian Ocean','Pelican'),('Indian Ocean','Penguin'),('Indian
+      Ocean','Pika'),('Indian Ocean','Prawn'),('Indian Ocean','Puffer Fish'),('Indian
+      Ocean','Rockhopper Penguin'),('Indian Ocean','Scorpion Fish'),('Indian Ocean','Sea
+      Lion'),('Indian Ocean','Sea Slug'),('Indian Ocean','Sea Squirt'),('Indian Ocean','Sea
+      Turtle'),('Indian Ocean','Sea Urchin'),('Indian Ocean','Seahorse'),('Indian Ocean','Seal'),('Indian
+      Ocean','Shrimp'),('Indian Ocean','Snail'),('Indian Ocean','Sperm Whale'),('Indian
+      Ocean','Spiny Dogfish'),('Indian Ocean','Sponge'),('Indian Ocean','Squid'),('Indian
+      Ocean','Starfish'),('Indian Ocean','Stingray'),('Indian Ocean','Tang'),('Indian
+      Ocean','Tiger Shark'),('Indian Ocean','Tropicbird'),('Indian Ocean','Whale Shark'),('Indian
+      Ocean','Wrasse'),('Indian Ocean','Zebra Shark'),('North America','Alaskan Malamute'),('North
+      America','Alligator'),('North America','American Bulldog'),('North America','American
+      Cocker Spaniel'),('North America','American Coonhound'),('North America','American
+      Eskimo Dog'),('North America','American Foxhound'),('North America','American
+      Pit Bull Terrier'),('North America','American Staffordshire Terrier'),('North
+      America','American Water Spaniel'),('North America','Anatolian Shepherd Dog'),('North
+      America','Ant'),('North America','Antelope'),('North America','Armadillo'),('North
+      America','Australian Shepherd'),('North America','Avocet'),('North America','Balinese'),('North
+      America','Barn Owl'),('North America','Bat'),('North America','Bear'),('North
+      America','Beaver'),('North America','Beetle'),('North America','Bird'),('North
+      America','Bison'),('North America','Black Bear'),('North America','Black Widow
+      Spider'),('North America','Blue Lacy Dog'),('North America','Bluetick Coonhound'),('North
+      America','Bobcat'),('North America','Bombay'),('North America','Boston Terrier'),('North
+      America','Boykin Spaniel'),('North America','Bullfrog'),('North America','Bumble
+      Bee'),('North America','Butterfly'),('North America','Carolina Dog'),('North America','Cat'),('North
+      America','Caterpillar'),('North America','Catfish'),('North America','Chesapeake
+      Bay Retriever'),('North America','Chicken'),('North America','Chinook'),('North
+      America','Chipmunk'),('North America','Coati'),('North America','Cockroach'),('North
+      America','Cougar'),('North America','Cow'),('North America','Coyote'),('North
+      America','Crane'),('North America','Crocodile'),('North America','Deer'),('North
+      America','Dog'),('North America','Donkey'),('North America','Dragonfly'),('North
+      America','Duck'),('North America','Eagle'),('North America','Earwig '),('North
+      America','Elephant'),('North America','English Shepherd'),('North America','Falcon'),('North
+      America','Fly'),('North America','Flying Squirrel'),('North America','Fox'),('North
+      America','Frog'),('North America','Gar'),('North America','Gila Monster'),('North
+      America','Glass Lizard'),('North America','Glow Worm'),('North America','Goose'),('North
+      America','Gopher'),('North America','Grasshopper'),('North America','Grizzly Bear'),('North
+      America','Hamster'),('North America','Hare'),('North America','Heron'),('North
+      America','Highland Cattle'),('North America','Himalayan'),('North America','Honey
+      Bee'),('North America','Horse'),('North America','Human'),('North America','Insect'),('North
+      America','Javanese'),('North America','Kingfisher'),('North America','Ladybird'),('North
+      America','Liger'),('North America','Lizard'),('North America','Long-Eared Owl'),('North
+      America','Lynx'),('North America','Maine Coon'),('North America','Mayfly'),('North
+      America','Millipede'),('North America','Mole'),('North America','Mongrel'),('North
+      America','Moorhen'),('North America','Moth'),('North America','Mountain Lion'),('North
+      America','Mouse'),('North America','Mule'),('North America','Newt'),('North America','Opossum'),('North
+      America','Otter'),('North America','Panther'),('North America','Pheasant'),('North
+      America','Pig'),('North America','Pika'),('North America','Pike'),('North America','Porcupine'),('North
+      America','Puffin'),('North America','Puma'),('North America','Quail'),('North
+      America','Rabbit'),('North America','Raccoon'),('North America','Ragdoll'),('North
+      America','Rat'),('North America','Rattlesnake'),('North America','Red Wolf'),('North
+      America','River Turtle'),('North America','Robin'),('North America','Sabre-Toothed
+      Tiger'),('North America','Scorpion'),('North America','Seahorse'),('North America','Sheep'),('North
+      America','Shrimp'),('North America','Siberian Husky'),('North America','Skunk'),('North
+      America','Snail'),('North America','Snake'),('North America','Snapping Turtle'),('North
+      America','Snowshoe'),('North America','Somali'),('North America','Spadefoot Toad'),('North
+      America','Sparrow'),('North America','Squirrel'),('North America','Stick Insect'),('North
+      America','Swan'),('North America','Termite'),('North America','Tiffany'),('North
+      America','Tiger Salamander'),('North America','Turkey'),('North America','Vulture'),('North
+      America','Wasp'),('North America','Water Buffalo'),('North America','Weasel'),('North
+      America','Wolf'),('North America','Wolverine'),('North America','Woodlouse'),('North
+      America','Woodpecker'),('North America','Zorse'),('Pacific Ocean','Albatross'),('Pacific
+      Ocean','Angelfish'),('Pacific Ocean','Barnacle'),('Pacific Ocean','Barracuda'),('Pacific
+      Ocean','Basking Shark'),('Pacific Ocean','Bird'),('Pacific Ocean','Blue Whale'),('Pacific
+      Ocean','Booby'),('Pacific Ocean','Bottle Nosed Dolphin'),('Pacific Ocean','Bull
+      Shark'),('Pacific Ocean','Butterfly Fish'),('Pacific Ocean','Clown Fish'),('Pacific
+      Ocean','Coral'),('Pacific Ocean','Crab'),('Pacific Ocean','Cuttlefish'),('Pacific
+      Ocean','Dolphin'),('Pacific Ocean','Dugong'),('Pacific Ocean','Dusky Dolphin'),('Pacific
+      Ocean','Elephant Seal'),('Pacific Ocean','Fin Whale'),('Pacific Ocean','Fish'),('Pacific
+      Ocean','Flounder'),('Pacific Ocean','Fly'),('Pacific Ocean','Frigatebird'),('Pacific
+      Ocean','Fur Seal'),('Pacific Ocean','Galapagos Penguin'),('Pacific Ocean','Galapagos
+      Tortoise'),('Pacific Ocean','Giant African Land Snail'),('Pacific Ocean','Giant
+      Clam'),('Pacific Ocean','Great White Shark'),('Pacific Ocean','Grey Reef Shark'),('Pacific
+      Ocean','Hammerhead Shark'),('Pacific Ocean','Hermit Crab'),('Pacific Ocean','Horn
+      Shark'),('Pacific Ocean','Horseshoe Crab'),('Pacific Ocean','Humboldt Penguin'),('Pacific
+      Ocean','Humpback Whale'),('Pacific Ocean','Insect'),('Pacific Ocean','Jellyfish'),('Pacific
+      Ocean','Killer Whale'),('Pacific Ocean','King Crab'),('Pacific Ocean','Lionfish'),('Pacific
+      Ocean','Lobster'),('Pacific Ocean','Magellanic Penguin'),('Pacific Ocean','Manatee'),('Pacific
+      Ocean','Manta Ray'),('Pacific Ocean','Minke Whale'),('Pacific Ocean','Moray Eel'),('Pacific
+      Ocean','Nurse Shark'),('Pacific Ocean','Octopus'),('Pacific Ocean','Oyster'),('Pacific
+      Ocean','Pelican'),('Pacific Ocean','Penguin'),('Pacific Ocean','Pika'),('Pacific
+      Ocean','Prawn'),('Pacific Ocean','Puffer Fish'),('Pacific Ocean','Rockhopper Penguin'),('Pacific
+      Ocean','Scorpion Fish'),('Pacific Ocean','Sea Dragon'),('Pacific Ocean','Sea Lion'),('Pacific
+      Ocean','Sea Otter'),('Pacific Ocean','Sea Slug'),('Pacific Ocean','Sea Squirt'),('Pacific
+      Ocean','Sea Turtle'),('Pacific Ocean','Sea Urchin'),('Pacific Ocean','Seahorse'),('Pacific
+      Ocean','Seal'),('Pacific Ocean','Shrimp'),('Pacific Ocean','Snail'),('Pacific
+      Ocean','Sperm Whale'),('Pacific Ocean','Spiny Dogfish'),('Pacific Ocean','Sponge'),('Pacific
+      Ocean','Squid'),('Pacific Ocean','Starfish'),('Pacific Ocean','Stingray'),('Pacific
+      Ocean','Tang'),('Pacific Ocean','Tiger Shark'),('Pacific Ocean','Tropicbird'),('Pacific
+      Ocean','Whale Shark'),('Pacific Ocean','Wrasse'),('Pacific Ocean','Zebra Shark'),('South
+      America','Ant'),('South America','Anteater'),('South America','Antelope'),('South
+      America','Armadillo'),('South America','Avocet'),('South America','Axolotl'),('South
+      America','Barb'),('South America','Barn Owl'),('South America','Bat'),('South
+      America','Bear'),('South America','Beetle'),('South America','Bird'),('South America','Black
+      Widow Spider'),('South America','Booby'),('South America','Brazilian Terrier'),('South
+      America','Butterfly'),('South America','Caiman'),('South America','Caiman Lizard'),('South
+      America','Capybara'),('South America','Cat'),('South America','Caterpillar'),('South
+      America','Catfish'),('South America','Centipede'),('South America','Chicken'),('South
+      America','Chihuahua'),('South America','Chinchilla'),('South America','Coati'),('South
+      America','Cockroach'),('South America','Collared Peccary'),('South America','Cottontop
+      Tamarin'),('South America','Cow'),('South America','Crab'),('South America','Crocodile'),('South
+      America','Darwins Frog'),('South America','Desert Tortoise'),('South America','Discus'),('South
+      America','Dog'),('South America','Dogo Argentino'),('South America','Donkey'),('South
+      America','Dragonfly'),('South America','Duck'),('South America','Earwig '),('South
+      America','Electric Eel'),('South America','Emperor Tamarin'),('South America','Flamingo'),('South
+      America','Fly'),('South America','Flying Squirrel'),('South America','Frog'),('South
+      America','Gar'),('South America','Gecko'),('South America','Geoffroys Tamarin'),('South
+      America','Giant African Land Snail'),('South America','Gila Monster'),('South
+      America','Glow Worm'),('South America','Golden Lion Tamarin'),('South America','Grasshopper'),('South
+      America','Guinea Pig'),('South America','Guppy'),('South America','Hamster'),('South
+      America','Havanese'),('South America','Hercules Beetle'),('South America','Honey
+      Bee'),('South America','Horned Frog'),('South America','Horse'),('South America','Howler
+      Monkey'),('South America','Human'),('South America','Hummingbird'),('South America','Ibis'),('South
+      America','Iguana'),('South America','Insect'),('South America','Jaguar'),('South
+      America','Keel Billed Toucan'),('South America','Kingfisher'),('South America','Ladybird'),('South
+      America','Lizard'),('South America','Llama'),('South America','Macaw'),('South
+      America','Marine Toad'),('South America','Mayfly'),('South America','Millipede'),('South
+      America','Molly'),('South America','Mongrel'),('South America','Monkey'),('South
+      America','Monte Iberia Eleuth'),('South America','Moorhen'),('South America','Moth'),('South
+      America','Mountain Lion'),('South America','Mouse'),('South America','Mule'),('South
+      America','Ocelot'),('South America','Otter'),('South America','Panther'),('South
+      America','Parrot'),('South America','Pheasant'),('South America','Pied Tamarin'),('South
+      America','Pika'),('South America','Pink Fairy Armadillo'),('South America','Piranha'),('South
+      America','Poison Dart Frog'),('South America','Porcupine'),('South America','Puma'),('South
+      America','Pygmy Marmoset'),('South America','Quail'),('South America','Quetzal'),('South
+      America','Rat'),('South America','Rattlesnake'),('South America','Red Knee Tarantula'),('South
+      America','Red-handed Tamarin'),('South America','River Dolphin'),('South America','River
+      Turtle'),('South America','Roseate Spoonbill'),('South America','Sabre-Toothed
+      Tiger'),('South America','Salamander'),('South America','Scorpion'),('South America','Seahorse'),('South
+      America','Shrimp'),('South America','Silver Dollar'),('South America','Sloth'),('South
+      America','Snail'),('South America','Snake'),('South America','Snapping Turtle'),('South
+      America','Sparrow'),('South America','Spectacled Bear'),('South America','Spider
+      Monkey'),('South America','Squirrel'),('South America','Squirrel Monkey'),('South
+      America','Stick Insect'),('South America','Swan'),('South America','Tapir'),('South
+      America','Termite'),('South America','Tetra'),('South America','Tortoise'),('South
+      America','Toucan'),('South America','Tree Frog'),('South America','Turkey'),('South
+      America','Uakari'),('South America','Umbrellabird'),('South America','Vampire
+      Bat'),('South America','Vulture'),('South America','Wasp'),('South America','White
+      Faced Capuchin'),('South America','Wolf'),('South America','Woodlouse'),('South
+      America','Woodpecker'),('South America','Woolly Monkey'),('South America','X-Ray
+      Tetra'),('South America','Zebu');\n/*!40000 ALTER TABLE `locations` ENABLE KEYS
+      */;\nUNLOCK TABLES;\n\n--\n-- Table structure for table `scientific_names`\n--\n\nDROP
+      TABLE IF EXISTS `scientific_names`;\n/*!40101 SET @saved_cs_client     = @@character_set_client
+      */;\n/*!40101 SET character_set_client = utf8 */;\nCREATE TABLE `scientific_names`
+      (\n  `name` tinytext,\n  `id` int(11) DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=latin1;\n/*!40101
+      SET character_set_client = @saved_cs_client */;\n\n--\n-- Dumping data for table
+      `scientific_names`\n--\n\nLOCK TABLES `scientific_names` WRITE;\n/*!40000 ALTER
+      TABLE `scientific_names` DISABLE KEYS */;\nINSERT INTO `scientific_names` VALUES
+      ('Acanthuridae',1739526581),('Achatina Fulica',1739526300),('Achatinoidea',1739526549),('Acinonyx
+      jubatus',1739526186),('Actinidia Deliciosa',1739526382),('Aegypius Monachus',1739526606),('Aepyceros
+      Melampus',1739526357),('Ailuropoda melanoleuca',1739526302),('Ailurus fulgens',1739526506),('Ajaja
+      ajaja',1739526516),('Alcelaphinae',1739526085),('Alces Alces',1739526433),('Alligator
+      mississippiensis',1739526071),('Alopex Lagopus',1739526087),('Alouatta',1739526348),('Ambystoma
+      Mexicanum',1739526101),('Ambystoma Tigrinum',1739526592),('Amphiprioninae',1739526199),('Anas
+      Platyrhynchos',1739526242),('Anguis Fragilis',1739526548),('Anisoptera',1739526240),('Anthozoa',1739526209),('Apatura
+      Iris',1739526490),('Apis',1739526343),('Apodemus Sylvaticus',1739526438),('Aptenodytes
+      Forsteri',1739526466),('Aptenodytes Patagonicus',1739526380),('Aptenodytes forsteri',1739526258),('Arachnocampa
+      luminosa',1739526308),('Arctictis binturong',1739526128),('Arctocephalinae',1739526289),('Ardeidae',1739526339),('Arini',1739526406),('Arvicola
+      amphibius',1739526613),('Atelerix Albiventris',1739526336),('Balaenoptera Acutorostrata',1739526424),('Balaenoptera
+      Physalus',1739526272),('Balsenoptera musculus',1739526139),('Barbus Barbus',1739526109),('Betta
+      Splendens',1739526541),('Bison Bison',1739526132),('Blattaria',1739526202),('Bombina',1739526274),('Bombus',1739526164),('Bos
+      Grunniens',1739526635),('Bos Primigenius Indicus',1739526640),('Bos Taurus',1739526340),('Brachypelma
+      Smithi',1739526505),('Brachyura',1739526214),('Branta',1739526313),('Bubalus Bubalis',1739526611),('Bubo
+      Scandiacus',1739526553),('Bufo Bufo',1739526208),('Bufo Marinus',1739526416),('Buteo
+      Buteo',1739526205),('Cacajao',1739526601),('Caelifera',1739526316),('Caimaninae',1739526169),('Callithrix
+      Pygmaea',1739526493),('Camelus Bactrianus',1739526104),('Camelus dromedarius',1739526172),('Canis
+      Aureus',1739526368),('Canis Lupus Dingo',1739526230),('Canis Lupus Rufus',1739526507),('Canis
+      Rufus',1739526626),('Canis latrans',1739526213),('Canis lupus familiaris',1739526234),('Canus
+      Lupus Arcticus',1739526089),('Capra Aegagrus Hircus',1739526309),('Capra Falconeri',1739526417),('Caracal
+      Caracal',1739526175),('Carcharhinus Amblyrhynchos',1739526323),('Carcharhinus
+      Leucas',1739526160),('Carcharodon Carcharias',1739526318),('Caridea',1739526539),('Castor
+      Canadensis',1739526122),('Casuarius',1739526403),('Caudata',1739526522),('Cavia
+      Porcellus',1739526329),('Cebus Capucinus',1739526621),('Cephalopterus',1739526603),('Ceratophrys
+      Ornata',1739526345),('Ceratotherium simum',1739526622),('Cerura Vinula',1739526491),('Cetorhinus
+      Maximus',1739526114),('Cettia diphone',1739526602),('Chaetodontidae',1739526168),('Chamaeleonidae',1739526184),('Chelonioidea',1739526532),('Chelydridae',1739526551),('Chilopoda',1739526182),('Chinchilla
+      Lanigera',1739526191),('Chiroptera',1739526116),('Chlamydosaurus Kingii',1739526287),('Chlamyphorus
+      truncatus',1739526473),('Chlorocebus pygerythrus',1739526605),('Choeropsis liberiensis',1739526492),('Choloepus
+      Hoffmani',1739526547),('Cichlidae',1739526197),('Cirripedia',1739526111),('Civettictis
+      civetta',1739526057),('Cnidaria Scyphozoa Aurelia',1739526374),('Coccinellidae',1739526388),('Coleoptera',1739526124),('Connochaetes
+      Taurinus',1739526625),('Coraciiformes',1739526381),('Coturnix Coturnix',1739526494),('Crocodylus',1739526218),('Crocuta
+      Crocuta',1739526353),('Cryptoprocta ferox',1739526282),('Cuon Alpinus',1739526229),('Cygnus
+      Atratus',1739526580),('Dasyatis Centroura',1739526572),('Dasypodidae',1739526090),('Dasyurus
+      Viverrinus',1739526497),('Delphinus Delphis',1739526237),('Demospongiae',1739526562),('Dendrobatidae',1739526477),('Dendrobranchiata',1739526484),('Desmodontinae',1739526604),('Dicerorhinus
+      Sumatrensis',1739526577),('Diceros Bicornis',1739526134),('Didelphis Virginiana',1739526454),('Diomedeidae',1739526069),('Diplopoda',1739526423),('Diptera',1739526280),('Dracaena
+      Guianensis',1739526170),('Dromaius Novaehollandiae',1739526260),('Dugong Dugon',1739526243),('Dynastes
+      Hercules',1739526337),('Echinoidea',1739526533),('Electrophorus Electricus',1739526254),('Elephantulus',1739526257),('Elephas
+      Maximus',1739526091),('Elephas Maximus Borneensis',1739526150),('Elephas Maximus
+      Indicus',1739526358),('Elephas Maximus Maximus',1739526566),('Elephas Maximus
+      Sumatranus',1739526575),('Eleutherodactylus Iberia',1739526431),('Emydidae',1739526512),('Enhydra
+      Lutris',1739526529),('Ephemeroptera',1739526421),('Equus Asinus',1739526238),('Equus
+      Caballus',1739526346),('Equus Mule',1739526439),('Equus zebra x Equus asinus',1739526641),('Equus
+      zebra x Equus caballus',1739526642),('Equus zebra, Equus quagga, Equus grevyi',1739526638),('Erethizon
+      Dorsaum',1739526482),('Erithacus Rubecula',1739526513),('Erythrocebus patas',1739526462),('Esox',1739526472),('Eudyptes
+      Chrysocome',1739526515),('Eudyptes Chrysolophus',1739526405),('Eudyptes Schlegeli',1739526518),('Eudyptes
+      robustus',1739526217),('Eudyptula Minor',1739526399),('Falconiforme',1739526268),('Felis
+      Concolor',1739526437),('Felis Domesticus',1739526178),('Felis Lynx',1739526404),('Felis
+      concolor',1739526489),('Formicidae',1739526083),('Fratercula arctica',1739526487),('Fregata',1739526286),('Funambulus
+      Palmarum',1739526359),('Galeocerdo Cuvier',1739526593),('Gallinula',1739526432),('Gallus
+      Gallus',1739526188),('Gavia Immer',1739526207),('Gavialis Gangeticus',1739526299),('Gekkonidae',1739526293),('Geochelone
+      Elegans',1739526594),('Geochelone Nigra',1739526291),('Geochelone Pardalis',1739526395),('Geochelone
+      gigantea',1739526070),('Gerbillinae',1739526296),('Gerridae',1739526479),('Ginglymostoma
+      Cirratum',1739526448),('Giraffa camelopardalis',1739526306),('Gliridae',1739526239),('Gopherus
+      Agassizii',1739526227),('Gorilla Berengei',1739526249),('Gorilla Berengei Berengei',1739526436),('Gorilla
+      Berengei Graueri',1739526250),('Gorilla Gorilla',1739526617),('Gorilla Gorilla
+      Diehli',1739526219),('Gorilla Gorilla Gorilla',1739526618),('Gruidae',1739526216),('Gulo
+      Gulo',1739526627),('Gynnidomorpha Alisman',1739526435),('Halichoerus Grypus',1739526324),('Helarctos
+      malayanus',1739526579),('Heleioporus',1739526166),('Heloderma Suspectum',1739526305),('Helogale
+      Parvula',1739526427),('Hemigalus Derbyanus',1739526107),('Heterodontus Francisci',1739526344),('Hieraatus
+      Spilogaster',1739526247),('Hippocampus',1739526534),('Hippopotamus amphibius',1739526342),('Holothuroidea',1739526530),('Homo
+      Sapiens Neanderthalensis',1739526440),('Homo Sapiens Sapiens',1739526349),('Hydrochoerus
+      hydrochaeris',1739526174),('Hydrodamalis Gigas',1739526570),('Hydrurga Leptonyx',1739526394),('Hyla',1739526596),('Hylobatidae',1739526304),('Hymenoptera',1739526610),('Iguana
+      Iguana',1739526356),('Indri indri',1739526363),('Insecta',1739526364),('Isoptera',1739526586),('Labridae',1739526633),('Lacerta
+      Agilis',1739526523),('Lacertilia',1739526400),('Lagenorhynchus obscurus',1739526245),('Lagothrix
+      Lagotricha',1739526632),('Lama Glama',1739526401),('Larva',1739526179),('Latrodectus',1739526136),('Lemmus
+      Lemmus',1739526390),('Lemur Catta',1739526391),('Leontopithecus Rosalia',1739526310),('Leopardus
+      pardalis',1739526449),('Lepisosteidae',1739526292),('Leptailurus serval',1739526536),('Lepus
+      Arcticus',1739526088),('Lepus Europaeus',1739526333),('Limulidae',1739526347),('Lissotriton
+      Vulgaris',1739526443),('Litoria Nasuta',1739526574),('Lopholithodes Mandtii',1739526379),('Loxodonta
+      Africana',1739526255),('Loxodonta africana africana',1739526056),('Loxodonta cyclotis',1739526059),('Lucanidae',1739526568),('Luscinia
+      Magarhynchos',1739526444),('Lutra Canadensis',1739526457),('Lycaon pictus',1739526063),('Lynx
+      rufus',1739526141),('Macaca Fascicularis',1739526430),('Macaca fuscata',1739526371),('Macropus',1739526607),('Macropus
+      Giganteus',1739526376),('Mammuthus Primigenius',1739526631),('Mandrillus Sphinx',1739526414),('Manta
+      Birostris',1739526415),('Megadyptes Antipodes',1739526636),('Megaptera Novaeangliae',1739526352),('Meleagris',1739526599),('Melopsittacus
+      Undulatus',1739526157),('Mephitis Mephitis',1739526546),('Merops Orientalis',1739526320),('Mesobatrachia',1739526556),('Mesocricetus
+      Auratus',1739526332),('Metynnis Argenteus',1739526545),('Microcebus Murinus',1739526322),('Mirounga',1739526256),('Moloch
+      Horridus',1739526588),('Muraenidae',1739526434),('Mustela Erminea',1739526573),('Mustela
+      Putorius Furo',1739526270),('Mustela nivalis',1739526614),('Myrmecobius Fasciatus',1739526447),('Myrmecophaga
+      Tridactyla',1739526084),('Nandinia binotata',1739526060),('Nasalis larvatus',1739526485),('Nasua
+      Nasua',1739526201),('Nectophryne afra',1739526062),('Neofelis nebulosa',1739526198),('Nephropidae',1739526402),('Numididae',1739526328),('Nyctereutes
+      Procyonoides',1739526500),('Ochotona Minor',1739526471),('Octopus Vulgaris',1739526450),('Odobenus
+      rosmarus',1739526608),('Odocoileus virginiana',1739526226),('Okapia johnstoni',1739526451),('Oniscidea',1739526629),('Ophisaurus',1739526307),('Orcinus
+      Orca',1739526378),('Oriolus oriolus',1739526311),('Ornithorhynchus Anatinus',1739526475),('Oryctolagus
+      cuniculus',1739526498),('Osteolaemus tetraspis',1739526246),('Ostreidae',1739526458),('Otariidae',1739526528),('Ovis
+      Aries',1739526537),('Paguma Larvata',1739526419),('Paguroidea',1739526338),('Pan
+      Paniscus',1739526145),('Pan troglodytes',1739526190),('Panthera Tigris',1739526591),('Panthera
+      Tigris Altaica',1739526544),('Panthera Tigris Amoyensis',1739526555),('Panthera
+      Tigris Corbetti',1739526362),('Panthera Tigris Jacksoni',1739526411),('Panthera
+      Tigris Sumatrae',1739526578),('Panthera Tigris Tigris',1739526125),('Panthera
+      leo',1739526397),('Panthera leo × Panthera tigris',1739526396),('Panthera onca',1739526369),('Panthera
+      pardus',1739526392),('Panthera pardus, Panthera onca',1739526460),('Panthera tigris
+      tigris',1739526623),('Papilionoidea',1739526167),('Papio',1739526103),('Paracheirodon
+      Axelrodi',1739526587),('Paradisaeidae',1739526130),('Paradoxurus Hermaphroditus',1739526093),('Paralichthys',1739526279),('Passeridae',1739526557),('Pavo
+      Cristatus',1739526463),('Pecari tajacu',1739526203),('Pelecanus Occidentalis',1739526465),('Pelophylax
+      Lessonae',1739526481),('Pelophylax Ridibundus',1739526418),('Pelophylax kl. esculentus',1739526252),('Perameles',1739526108),('Phacochoerus
+      Africanus',1739526609),('Phaethon',1739526597),('Phalanger Maculatus',1739526221),('Phalangeriforme',1739526483),('Pharomachrus,
+      Euptilotis',1739526495),('Phascolarctos cinereus',1739526383),('Phasianus Colchicus',1739526468),('Phasmatodea',1739526571),('Phoca
+      vitulina',1739526535),('Phoenicopterus',1739526277),('Phycodurus Eques',1739526527),('Physeter
+      Macrocephalus',1739526559),('Physignathus',1739526612),('Pica Pica',1739526408),('Picidae',1739526630),('Platanistoidea',1739526511),('Poecilia',1739526426),('Poecilia
+      Reticulata',1739526330),('Pogona Vitticeps',1739526121),('Pomacanthidae',1739526082),('Pongo
+      abelii',1739526576),('Pongo pygmaeus',1739526149),('Pongo pygmaeus, Pongo abelii',1739526455),('Prionailurus
+      Bengalensis',1739526393),('Prionailurus viverrinus',1739526276),('Pristella maxillaris',1739526634),('Procavia
+      capensis',1739526514),('Procyon Lotor',1739526499),('Proteus Anguinus',1739526453),('Protoreaster
+      Nodosus',1739526569),('Pseudoryx nghetinhensis',1739526524),('Psittacine',1739526461),('Pterois
+      volitans',1739526398),('Pteromyini',1739526281),('Pygocentrus Nattereri',1739526474),('Pygoscelis
+      Antarcticus',1739526194),('Pygoscelis adeliae',1739526053),('Pygoscelis papua',1739526294),('Ramphastos
+      Sulfuratus',1739526377),('Ramphastos Toco',1739526595),('Rana Catesbeiana',1739526163),('Rana
+      Temporaria',1739526288),('Rangifer Tarandus',1739526509),('Raphus Cucullatus',1739526233),('Rattus
+      Rattus',1739526503),('Recurvirostra',1739526100),('Rhincodon Typus',1739526619),('Rhinoceros
+      Sondaicus',1739526372),('Rhinoceros Unicornis',1739526360),('Rhinocerotidae',1739526510),('Rhinoderma
+      Darwinii',1739526225),('Rupicapra Rupicapra',1739526185),('Saguinus Bicolor',1739526469),('Saguinus
+      Geoffroyi',1739526295),('Saguinus Imperator',1739526259),('Saguinus Midas',1739526508),('Saguinus
+      Oedipus',1739526210),('Saimiri',1739526565),('Sarcophilus Harrisii',1739526584),('Sciuridae',1739526564),('Scorpaenidae',1739526526),('Scorpiones',1739526525),('Sepiida',1739526222),('Serpentes',1739526550),('Setonix
+      brachyurus',1739526496),('Siluriformes',1739526180),('Simia Paniscus',1739526560),('Smilodon
+      populator',1739526520),('Spermophilus Richardsonii',1739526314),('Spheniscus Humboldti',1739526350),('Spheniscus
+      Magellanicus',1739526407),('Spheniscus Mendiculus',1739526290),('Spheniscus demersus',1739526061),('Sphenodon
+      Punctatus',1739526598),('Sphyraena',1739526112),('Sphyrna Zygaena',1739526331),('Squalus
+      Acanthias',1739526561),('Stegostoma Fasciatum',1739526639),('Strigops Habroptilus',1739526375),('Strix
+      Aluco',1739526585),('Struthio Camelus',1739526456),('Sula Nebouxii',1739526146),('Suricata
+      suricatta',1739526422),('Sus Scrofa Scrofa',1739526470),('Sus scrofa',1739526624),('Symphysodon',1739526231),('Syncerus
+      Caffer',1739526158),('Tachyglossus Aculeatus',1739526251),('Talpidae',1739526425),('Tamias
+      Striatus',1739526195),('Tapirus',1739526582),('Tarsius',1739526583),('Taxidea
+      Taxus',1739526105),('Tetraodontidae',1739526486),('Tetraoninae',1739526327),('Teuthida',1739526563),('Threskiornithidae',1739526354),('Thylogale',1739526459),('Tragelaphus
+      Strepsiceros',1739526385),('Tragelaphus eurycerus',1739526144),('Tremarctos Ornatus',1739526558),('Trichechus
+      Manatu',1739526413),('Tridacna Gigas',1739526301),('Trochilidae',1739526351),('Troglodytes
+      Gorilla',1739526315),('Tursiops Truncatus',1739526152),('Tyto Alba',1739526110),('Urochordata',1739526531),('Uroplatus',1739526389),('Ursidae',1739526119),('Ursus
+      Arctos',1739526156),('Ursus Arctos Horriblis',1739526326),('Ursus americanus',1739526133),('Ursus
+      maritimus',1739526478),('Ursus tibetanus',1739526094),('Varanus Indicus',1739526429),('Varanus
+      komodoensis',1739526384),('Vespa mandarinia',1739526092),('Viverra Tangalunga',1739526410),('Vombatus
+      Ursinus',1739526628),('Vulpes Zerda',1739526269),('Vulpes vulpes',1739526283),('Xenopus
+      laevis',1739526058);\n/*!40000 ALTER TABLE `scientific_names` ENABLE KEYS */;\nUNLOCK
+      TABLES;\n/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;\n\n/*!40101 SET SQL_MODE=@OLD_SQL_MODE
+      */;\n/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;\n/*!40014 SET
+      UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */;\n/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT
+      */;\n/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;\n/*!40101
+      SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;\n/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES
+      */;\n\n-- Dump completed on 2014-12-13  6:00:32"
+
+################################################################################
+# Service:     interconnect
+# Description: Headless service (clusterIP: None), needed to address StatefulSet
+#              pods individually
+# Ports:       * 3306 (Standard MySQL port)
+#              * 3307 (Clonation port)
+################################################################################
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${RRC_HEADLESS_SERVICE_NAME}
+  spec:
+    clusterIP: None
+    ports:
+    - name: mysql-port
+      port: 3306
+      protocol: TCP
+      targetPort: 3306
+    - name: mysql-clone
+      port: 3307
+      protocol: TCP
+      targetPort: 3307
+    publishNotReadyAddresses: true
+    selector:
+      app: ${RRC_NAME}
+      app.kubernetes.io/name: ${RRC_NAME}
+    type: ClusterIP
+
+################################################################################
+# Service:     mysql-read
+# Description: Read-only service to round-robin access the StatefulSet pods for
+#              SELECTS
+# Ports:       * 3306 (Standard MySQL port)
+################################################################################
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${RRC_READONLY_SERVICE_NAME}
+  spec:
+    ports:
+    - name: mysql-port
+      port: 3306
+      protocol: TCP
+      targetPort: 3306
+    selector:
+      app: ${RRC_NAME}
+      app.kubernetes.io/name: ${RRC_NAME}
+    type: ClusterIP
+
+################################################################################
+# StatefulSet: mysql    
+# Description: MySQL Read Replica Cluster (RRC) main resource. It creates 
+#              MySql instance pods in an orderly manner using ORDINALS, a number
+#              greater than or equal to zero:
+#              The first created pod, mysql-0, is the source instance
+#              The second, third, ... are read replicas
+#              Pod creation process has three phases
+#              * Phase 1 (image name: rrc-pre). This phase clone the database 
+#                from its "left buddy", using Percona Xtrabackup utilities. 
+#                (xbstream for restore and xtrabackup --prepare for preparation)
+#                This phase must be executed prior to the database init process, 
+#                so it's defined in the initContainers section of the 
+#                StatefulSet. Also, this phase is ignored for the Source 
+#                instance as there's no "left buddy" to clone from
+#              * Phase 2 (image name: rrc-mysql). This phase starts the MySQL 
+#                instance as Source role (StatefulSet ordinal = 0) or Replica 
+#                role (ordinal > 0). For the Source instance the database is 
+#                initialized, including the creation of the following extra 
+#                database objects:
+#                o The Replication user, to avoid using the root credentials 
+#                  for replication activities. The following environment 
+#                  variables are needed: MYSQL_SOURCE_USER and 
+#                  MYSQL_SOURCE_PASSWORD
+#                o The Clone user, to avoid using the root credentials for 
+#                  the backup process. The following environment variables
+#                  are needed: MYSQL_BACKUP_USER and MYSQL_BACKUP_PASSWORD
+#              * Phase 3 (image name: rrc-post). This phase waits for the
+#                previous one (MySQL start) and request to the source instance
+#                to start a replication process from the clone position, 
+#                avoiding thus to start replication from "the begining of time". 
+#                Of course, this request is only needed in replicas. 
+#                In either case (source or replicas) it start a "backup server"
+#                to be consumed by its "right buddy" as the clone source
+#                           
+################################################################################
+- apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    name: ${RRC_NAME}
+  spec:
+    persistentVolumeClaimRetentionPolicy:
+      whenDeleted: Delete
+      whenScaled: Retain
+    replicas: 1
+    selector:
+      matchLabels:
+        app: ${RRC_NAME}
+        app.kubernetes.io/name: ${RRC_NAME}
+    serviceName: ${RRC_HEADLESS_SERVICE_NAME}
+    updateStrategy:
+      rollingUpdate:
+        partition: 0
+      type: RollingUpdate
+    template:
+      metadata:
+        labels:
+          app: ${RRC_NAME}
+          app.kubernetes.io/name: ${RRC_NAME}
+      spec:
+        initContainers:
+        # Clone from the "left buddy"
+        - name: rrc-pre
+          image: ${RRC_STS_RRC_IMAGE}
+          imagePullPolicy: IfNotPresent 
+          command:
+          - /opt/rrc/rrc-pre
+          env:
+          # The name of the headless service
+          - name: RRC_HLSERVICE
+            valueFrom:
+              secretKeyRef:
+                key: RRC_HLSERVICE
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          volumeMounts:
+          - mountPath: /var/lib/mysql
+            name: data-vol
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        containers:
+        # MySQL start
+        - name: rrc-mysql
+          image: ${RRC_STS_MYSQL_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command:
+          - /opt/rrc/rrc-run-mysqld
+          env:
+          - name: MYSQL_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_ROOT_PASSWORD
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_USER
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_USER
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_PASSWORD
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_DATABASE
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_DATABASE
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_SOURCE_USER
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_SOURCE_USER
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_SOURCE_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_SOURCE_PASSWORD
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_BACKUP_USER
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_BACKUP_USER
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_BACKUP_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_BACKUP_PASSWORD
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          ports:
+          - containerPort: 3306
+            name: mysql-port
+            protocol: TCP
+          livenessProbe:
+            exec:
+              command:
+              - /opt/rrc/rrc-instance-alive
+            failureThreshold: 3
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+              - /opt/rrc/rrc-instance-ready
+            failureThreshold: 3
+            initialDelaySeconds: 30
+            periodSeconds: 2
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources:
+            limits:
+              cpu: ${RRC_STS_MYSQL_LIMITS_CPU}
+              memory: ${RRC_STS_MYSQL_LIMITS_MEMORY}
+            requests:
+              cpu: ${RRC_STS_MYSQL_REQUEST_CPU}
+              memory: ${RRC_STS_MYSQL_REQUEST_MEMORY}
+          volumeMounts:
+          - mountPath: /var/lib/mysql
+            name: data-vol
+          - mountPath: /opt/rrc
+            name: rrc-vol
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        - name: rrc-post
+          image: ${RRC_STS_RRC_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command:
+          - /opt/rrc/rrc-post
+          env:
+          # The name of the headless service
+          - name: RRC_HLSERVICE
+            valueFrom:
+              secretKeyRef:
+                key: RRC_HLSERVICE
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_SOURCE_USER
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_SOURCE_USER
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_SOURCE_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_SOURCE_PASSWORD
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_BACKUP_USER
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_BACKUP_USER
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          - name: MYSQL_BACKUP_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: MYSQL_BACKUP_PASSWORD
+                name: ${RRC_MYSQL_CREDS_SECRET_NAME}
+          # IMPORTANT: DO NOT CONFIGURE TCP PROBES on clone-port (3307)!!!
+          # Every TCP connection triggers a full backup!!!
+          ports:
+          - containerPort: 3307
+            name: clone-port
+            protocol: TCP
+          resources:
+            limits:
+              cpu: ${RRC_STS_RRC_LIMITS_CPU}
+              memory: ${RRC_STS_RRC_LIMITS_MEMORY}
+            requests:
+              cpu: ${RRC_STS_RRC_REQUEST_CPU}
+              memory: ${RRC_STS_RRC_REQUEST_MEMORY}
+          volumeMounts:
+          - mountPath: /var/lib/mysql
+            name: ${RRC_STS_VOLUME_NAME}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+      
+        # This is needed for private registry pulling
+        imagePullSecrets:
+        - name: ${RRC_IMAGE_PULL_SECRET_NAME}
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: default
+        serviceAccountName: default
+        terminationGracePeriodSeconds: 30
+
+        # Script configmap
+        volumes:
+        - configMap:
+            defaultMode: 509
+            name: ${RRC_SCRIPTS_CONFIGMAP_NAME}
+          name: rrc-vol
+    volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: ${RRC_STS_VOLUME_NAME}
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: ${RRC_STS_VOLUME_SIZE}
+        volumeMode: Filesystem
+
+################################################################################
+# Parameters                
+################################################################################
+parameters: 
+- name: RRC_NAME
+  description: The name of the RRC MySQL Release
+  value: mysql
+- name: RRC_MYSQL_CREDS_SECRET_NAME
+  description: MySQL credentials secret name
+  value: mysql-creds
+- name: RRC_MYSQL_ROOT_PASSWORD
+  description: MySQL root password
+  from: "[a-zA-Z0-9]{16}"
+  generate: expression
+- name: RRC_MYSQL_USER
+  description: MySQL database user name
+  value: testuser
+- name: RRC_MYSQL_PASSWORD
+  description: MySQL database user password
+  from: "[a-zA-Z0-9]{16}"
+  generate: expression
+- name: RRC_MYSQL_DATABASE
+  description: MySQL database user name
+  value: test
+- name: RRC_MYSQL_SOURCE_USER
+  description: MySQL database user name
+  value: replicauser
+- name: RRC_MYSQL_SOURCE_PASSWORD
+  description: MySQL replica user password
+  from: "[a-zA-Z0-9]{16}"
+  generate: expression
+- name: RRC_MYSQL_BACKUP_USER
+  description: MySQL clone user name
+  value: backupuser
+- name: RRC_MYSQL_BACKUP_PASSWORD
+  description: MySQL clone user password
+  from: "[a-zA-Z0-9]{16}"
+  generate: expression
+- name: RRC_IMAGE_PULL_SECRET_NAME
+  description: Registry credentials pull secret
+  value: rh-registry-creds
+- name: RRC_PRIVATE_REGISTRY_URL
+  description: Private registry URL for container pull
+  value: registry.redhat.io
+- name: RRC_PRIVATE_REGISTRY_AUTH_TOKEN
+  description: Access token for Private registry authentication
+  value: "<Token>"
+- name: RRC_MYSQL_DBDUMP_CONFIGMAP_NAME
+  description: Name of the MySQL db dump file configmap
+  value: dbdump
+- name: RRC_SCRIPTS_CONFIGMAP_NAME
+  description: Name of the RRC scripts configmap
+  value: rrc-scripts
+- name: RRC_HEADLESS_SERVICE_NAME
+  description: Name of the headless service, needed for individual pod addressing
+  value: interconnect
+- name: RRC_READONLY_SERVICE_NAME
+  description: Name of the readonly service (round robin)
+  value: mysql-read
+- name: RRC_STS_RRC_IMAGE
+  description: RRC container image
+  value: quay.io/jnmalledo/sts-rrc-utils:1.1
+- name: RRC_STS_MYSQL_IMAGE
+  description: MySQL container image
+  value: registry.redhat.io/rhel9/mysql-80:latest
+- name: RRC_STS_VOLUME_NAME
+  description: Statefulset Persistent Volume Claim template name
+  value: data-vol
+- name: RRC_STS_VOLUME_SIZE
+  description: Statefulset Persistent Volume Claim size
+  value: 1Gi
+- name: RRC_STS_MYSQL_REQUEST_CPU
+  description: Statefulset Resource CPU request for MySQL container
+  value: 100m
+- name: RRC_STS_MYSQL_REQUEST_MEMORY
+  description: Statefulset Resource memory request for MySQL container
+  value: 256Mi
+- name: RRC_STS_MYSQL_LIMITS_CPU
+  description: Statefulset Resource CPU limits for MySQL container
+  value: 200m
+- name: RRC_STS_MYSQL_LIMITS_MEMORY
+  description: Statefulset Resource memory limits for MySQL container
+  value: 512Mi
+- name: RRC_STS_RRC_REQUEST_CPU
+  description: Statefulset Resource CPU request for RRC container
+  value: 50m
+- name: RRC_STS_RRC_REQUEST_MEMORY
+  description: Statefulset Resource memory request for RRC container
+  value: 128Mi
+- name: RRC_STS_RRC_LIMITS_CPU
+  description: Statefulset Resource CPU limits for RRC container
+  value: 100m
+- name: RRC_STS_RRC_LIMITS_MEMORY
+  description: Statefulset Resource memory limits for RRC container
+  value: 256Mi
